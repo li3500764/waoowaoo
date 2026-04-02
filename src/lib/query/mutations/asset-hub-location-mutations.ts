@@ -72,14 +72,27 @@ export function useGenerateLocationImage() {
   const invalidateLocations = () => invalidateGlobalLocations(queryClient)
 
   return useMutation({
-    mutationFn: async (locationId: string) => {
-      return await requestJsonWithError('/api/asset-hub/generate-image', {
+    mutationFn: async ({
+      locationId,
+      artStyle,
+      count,
+    }: {
+      locationId: string
+      artStyle?: string
+      count?: number
+    }) => {
+      return await requestJsonWithError(`/api/assets/${locationId}/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'location', id: locationId }),
+        body: JSON.stringify({
+          scope: 'global',
+          kind: 'location',
+          artStyle,
+          count,
+        }),
       }, 'Failed to generate image')
     },
-    onMutate: (locationId) => {
+    onMutate: ({ locationId }) => {
       upsertTaskTargetOverlay(queryClient, {
         projectId: GLOBAL_ASSET_PROJECT_ID,
         targetType: 'GlobalLocation',
@@ -87,7 +100,7 @@ export function useGenerateLocationImage() {
         intent: 'generate',
       })
     },
-    onError: (_error, locationId) => {
+    onError: (_error, { locationId }) => {
       clearTaskTargetOverlay(queryClient, {
         projectId: GLOBAL_ASSET_PROJECT_ID,
         targetType: 'GlobalLocation',
@@ -114,12 +127,12 @@ export function useModifyLocationImage() {
       modifyPrompt: string
       extraImageUrls?: string[]
     }) => {
-      return await requestJsonWithError('/api/asset-hub/modify-image', {
+      return await requestJsonWithError(`/api/assets/${locationId}/modify-render`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          type: 'location',
-          id: locationId,
+          scope: 'global',
+          kind: 'location',
           imageIndex,
           modifyPrompt,
           extraImageUrls,
@@ -160,12 +173,12 @@ export function useSelectLocationImage() {
       imageIndex: number | null
       confirm?: boolean
     }) => {
-      return await requestJsonWithError('/api/asset-hub/select-image', {
+      return await requestJsonWithError(`/api/assets/${locationId}/select-render`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          type: 'location',
-          id: locationId,
+          scope: 'global',
+          kind: 'location',
           imageIndex,
           confirm,
         }),
@@ -216,10 +229,13 @@ export function useUndoLocationImage() {
 
   return useMutation({
     mutationFn: async (locationId: string) => {
-      return await requestJsonWithError('/api/asset-hub/undo-image', {
+      return await requestJsonWithError(`/api/assets/${locationId}/revert-render`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ type: 'location', id: locationId }),
+        body: JSON.stringify({
+          scope: 'global',
+          kind: 'location',
+        }),
       }, 'Failed to undo image')
     },
     onSuccess: invalidateLocations,

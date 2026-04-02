@@ -24,7 +24,8 @@ import {
 } from './base'
 import { getProviderConfig } from '@/lib/api-config'
 import { submitFalTask } from '@/lib/async-submit'
-import { imageUrlToBase64 } from '@/lib/cos'
+import { normalizeToBase64ForGeneration } from '@/lib/media/outbound-image'
+import { buildFalQueueUrl } from '@/lib/providers/fal/base-url'
 
 // ============================================================
 // 图像模型端点映射（modelId → FAL 端点前缀）
@@ -130,7 +131,7 @@ export class FalImageGenerator extends BaseImageGenerator {
                     // 如果已经是data URL，直接返回
                     if (url.startsWith('data:')) return url
                     // 否则转换为Data URL
-                    return await imageUrlToBase64(url)
+                    return await normalizeToBase64ForGeneration(url)
                 })
             )
             body.image_urls = dataUrls
@@ -146,7 +147,7 @@ export class FalImageGenerator extends BaseImageGenerator {
         logger.info({
             message: 'FAL image request body summary',
             details: {
-                url: `https://queue.fal.run/${endpoint}`,
+                url: buildFalQueueUrl(endpoint),
                 promptLength: prompt.length,
                 imageUrlsCount: hasReferenceImages ? (body.image_urls as string[]).length : 0,
                 resolution: body.resolution ?? null,
@@ -156,7 +157,7 @@ export class FalImageGenerator extends BaseImageGenerator {
         })
 
         // 提交异步任务
-        const submitResponse = await fetch(`https://queue.fal.run/${endpoint}`, {
+        const submitResponse = await fetch(buildFalQueueUrl(endpoint), {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',

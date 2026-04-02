@@ -7,6 +7,10 @@ import {
     type ModelCapabilities,
     type UnifiedModelType,
 } from '@/lib/model-config-contract'
+import type {
+    OpenAICompatMediaTemplate,
+    OpenAICompatMediaTemplateSource,
+} from '@/lib/openai-compat-media-template'
 
 // 统一提供商接口
 export interface Provider {
@@ -15,13 +19,26 @@ export interface Provider {
     baseUrl?: string
     apiKey?: string
     hasApiKey?: boolean
-    apiMode?: 'gemini-sdk'  // API 模式：gemini-sdk（默认）
+    hidden?: boolean
+    apiMode?: 'gemini-sdk' | 'openai-official'
+    gatewayRoute?: 'official' | 'openai-compat'
 }
 
-// 用户自定义定价（用于内置目录中没有的模型，如 OpenRouter）
+export interface LlmCustomPricing {
+    inputPerMillion?: number
+    outputPerMillion?: number
+}
+
+export interface MediaCustomPricing {
+    basePrice?: number
+    optionPrices?: Record<string, Record<string, number>>
+}
+
+// 用户自定义定价 V2（能力参数可定价）
 export interface CustomModelPricing {
-    input?: number     // LLM 输入 token 单价（每百万 token）
-    output?: number    // LLM 输出 token 单价（每百万 token）
+    llm?: LlmCustomPricing
+    image?: MediaCustomPricing
+    video?: MediaCustomPricing
 }
 
 // 模型接口
@@ -31,6 +48,11 @@ export interface CustomModel {
     name: string          // 显示名称
     type: UnifiedModelType
     provider: string
+    llmProtocol?: 'responses' | 'chat-completions'
+    llmProtocolCheckedAt?: string
+    compatMediaTemplate?: OpenAICompatMediaTemplate
+    compatMediaTemplateCheckedAt?: string
+    compatMediaTemplateSource?: OpenAICompatMediaTemplateSource
     price: number
     priceMin?: number
     priceMax?: number
@@ -56,6 +78,11 @@ export type PricingDisplayMap = Record<string, PricingDisplayItem>
 export interface ApiConfig {
     models: CustomModel[]
     providers: Provider[]
+    workflowConcurrency?: {
+        analysis: number
+        image: number
+        video: number
+    }
     pricingDisplay?: PricingDisplayMap
 }
 
@@ -69,10 +96,12 @@ export const PRESET_MODELS: PresetModel[] = [
     { modelId: 'google/gemini-3-flash-preview', name: 'Gemini 3 Flash', type: 'llm', provider: 'openrouter' },
     { modelId: 'anthropic/claude-sonnet-4.5', name: 'Claude Sonnet 4.5', type: 'llm', provider: 'openrouter' },
     { modelId: 'anthropic/claude-sonnet-4', name: 'Claude Sonnet 4', type: 'llm', provider: 'openrouter' },
+    { modelId: 'openai/gpt-5.4', name: 'GPT-5.4', type: 'llm', provider: 'openrouter' },
+    { modelId: 'google/gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash Lite', type: 'llm', provider: 'openrouter' },
     // Google AI Studio 文本模型
     { modelId: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro', type: 'llm', provider: 'google' },
-    { modelId: 'gemini-3-pro-preview', name: 'Gemini 3 Pro', type: 'llm', provider: 'google' },
     { modelId: 'gemini-3-flash-preview', name: 'Gemini 3 Flash', type: 'llm', provider: 'google' },
+    { modelId: 'gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash-Lite', type: 'llm', provider: 'google' },
     // 火山引擎 Doubao 文本模型
     { modelId: 'doubao-seed-1-8-251228', name: 'Doubao Seed 1.8', type: 'llm', provider: 'ark' },
     { modelId: 'doubao-seed-2-0-pro-260215', name: 'Doubao Seed 2.0 Pro', type: 'llm', provider: 'ark' },
@@ -80,12 +109,22 @@ export const PRESET_MODELS: PresetModel[] = [
     { modelId: 'doubao-seed-2-0-mini-260215', name: 'Doubao Seed 2.0 Mini', type: 'llm', provider: 'ark' },
     { modelId: 'doubao-seed-1-6-251015', name: 'Doubao Seed 1.6', type: 'llm', provider: 'ark' },
     { modelId: 'doubao-seed-1-6-lite-251015', name: 'Doubao Seed 1.6 Lite', type: 'llm', provider: 'ark' },
+    // 阿里云百炼文本模型
+    { modelId: 'qwen3.5-plus', name: 'Qwen 3.5 Plus', type: 'llm', provider: 'bailian' },
+    { modelId: 'qwen3.5-flash', name: 'Qwen 3.5 Flash', type: 'llm', provider: 'bailian' },
+    // MiniMax 官方文本模型
+    { modelId: 'MiniMax-M2.5', name: 'MiniMax M2.5', type: 'llm', provider: 'minimax' },
+    { modelId: 'MiniMax-M2.5-highspeed', name: 'MiniMax M2.5 Highspeed', type: 'llm', provider: 'minimax' },
+    { modelId: 'MiniMax-M2.1', name: 'MiniMax M2.1', type: 'llm', provider: 'minimax' },
+    { modelId: 'MiniMax-M2.1-highspeed', name: 'MiniMax M2.1 Highspeed', type: 'llm', provider: 'minimax' },
+    { modelId: 'MiniMax-M2', name: 'MiniMax M2', type: 'llm', provider: 'minimax' },
 
     // 图像模型
     { modelId: 'banana', name: 'Banana Pro', type: 'image', provider: 'fal' },
     { modelId: 'banana-2', name: 'Banana 2', type: 'image', provider: 'fal' },
     { modelId: 'doubao-seedream-4-5-251128', name: 'Seedream 4.5', type: 'image', provider: 'ark' },
     { modelId: 'doubao-seedream-4-0-250828', name: 'Seedream 4.0', type: 'image', provider: 'ark' },
+    { modelId: 'doubao-seedream-5-0-260128', name: 'Seedream 5.0 Lite', type: 'image', provider: 'ark' },
     { modelId: 'gemini-3-pro-image-preview', name: 'Banana Pro', type: 'image', provider: 'google' },
     { modelId: 'gemini-3.1-flash-image-preview', name: 'Nano Banana 2', type: 'image', provider: 'google' },
     { modelId: 'gemini-3-pro-image-preview-batch', name: 'Banana Pro (Batch)', type: 'image', provider: 'google' },
@@ -105,6 +144,13 @@ export const PRESET_MODELS: PresetModel[] = [
     { modelId: 'veo-3.0-generate-001', name: 'Veo 3.0', type: 'video', provider: 'google' },
     { modelId: 'veo-3.0-fast-generate-001', name: 'Veo 3.0 Fast', type: 'video', provider: 'google' },
     { modelId: 'veo-2.0-generate-001', name: 'Veo 2.0', type: 'video', provider: 'google' },
+    // 阿里云百炼图生视频模型
+    { modelId: 'wan2.6-i2v-flash', name: 'Wan2.6 I2V Flash', type: 'video', provider: 'bailian' },
+    { modelId: 'wan2.6-i2v', name: 'Wan2.6 I2V', type: 'video', provider: 'bailian' },
+    { modelId: 'wan2.5-i2v-preview', name: 'Wan2.5 I2V Preview', type: 'video', provider: 'bailian' },
+    { modelId: 'wan2.2-i2v-plus', name: 'Wan2.2 I2V Plus', type: 'video', provider: 'bailian' },
+    { modelId: 'wan2.2-kf2v-flash', name: 'Wan2.2 KF2V Flash', type: 'video', provider: 'bailian' },
+    { modelId: 'wanx2.1-kf2v-plus', name: 'WanX2.1 KF2V Plus', type: 'video', provider: 'bailian' },
     { modelId: 'fal-wan25', name: 'Wan 2.6', type: 'video', provider: 'fal' },
     { modelId: 'fal-veo31', name: 'Veo 3.1', type: 'video', provider: 'fal' },
     { modelId: 'fal-sora2', name: 'Sora 2', type: 'video', provider: 'fal' },
@@ -114,9 +160,12 @@ export const PRESET_MODELS: PresetModel[] = [
 
     // 音频模型
     { modelId: 'fal-ai/index-tts-2/text-to-speech', name: 'IndexTTS 2', type: 'audio', provider: 'fal' },
+    { modelId: 'qwen3-tts-vd-2026-01-26', name: 'Qwen3 TTS', type: 'audio', provider: 'bailian' },
+    { modelId: 'qwen-voice-design', name: 'Qwen Voice Design', type: 'audio', provider: 'bailian' },
     // 口型同步模型
     { modelId: 'fal-ai/kling-video/lipsync/audio-to-video', name: 'Kling Lip Sync', type: 'lipsync', provider: 'fal' },
     { modelId: 'vidu-lipsync', name: 'Vidu Lip Sync', type: 'lipsync', provider: 'vidu' },
+    { modelId: 'videoretalk', name: 'VideoRetalk Lip Sync', type: 'lipsync', provider: 'bailian' },
 
     // MiniMax 视频模型
     { modelId: 'minimax-hailuo-2.3', name: 'Hailuo 2.3', type: 'video', provider: 'minimax' },
@@ -151,17 +200,19 @@ export function isPresetComingSoonModelKey(modelKey: string): boolean {
 export const PRESET_PROVIDERS: Omit<Provider, 'apiKey' | 'hasApiKey'>[] = [
     { id: 'ark', name: 'Volcengine Ark' },
     { id: 'google', name: 'Google AI Studio' },
+    { id: 'bailian', name: 'Alibaba Bailian' },
     { id: 'openrouter', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' },
-    { id: 'minimax', name: 'MiniMax Hailuo' },
+    { id: 'minimax', name: 'MiniMax Hailuo', baseUrl: 'https://api.minimaxi.com/v1' },
     { id: 'vidu', name: 'Vidu' },
     { id: 'fal', name: 'FAL' },
-    { id: 'qwen', name: 'Qwen' },
 ]
 
 const ZH_PROVIDER_NAME_MAP: Record<string, string> = {
     ark: '火山引擎 Ark',
     minimax: '海螺 MiniMax',
     vidu: '生数科技 Vidu',
+    bailian: '阿里云百炼',
+    siliconflow: '硅基流动',
 }
 
 function isZhLocale(locale?: string): boolean {
@@ -322,14 +373,23 @@ export const PROVIDER_TUTORIALS: ProviderTutorial[] = [
         ]
     },
     {
-        providerId: 'qwen',
+        providerId: 'bailian',
         steps: [
             {
-                text: 'qwen_step1',
+                text: 'bailian_step1',
                 url: 'https://bailian.console.aliyun.com/cn-beijing/?tab=model#/api-key'
             }
         ]
-    }
+    },
+    {
+        providerId: 'siliconflow',
+        steps: [
+            {
+                text: 'siliconflow_step1',
+                url: 'https://cloud.siliconflow.cn/account/ak'
+            }
+        ]
+    },
 ]
 
 /**

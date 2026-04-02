@@ -1,3 +1,4 @@
+import { safeParseJson, safeParseJsonArray } from '@/lib/json-repair'
 import { prisma } from '@/lib/prisma'
 import type { StoryboardPanel } from '@/lib/storyboard-phases'
 
@@ -18,6 +19,7 @@ export type PersistedStoryboard = {
     description: string | null
     srtSegment: string | null
     characters: string | null
+    props: string | null
   }>
 }
 
@@ -48,19 +50,27 @@ function parsePanelCharacters(raw: string | null): string[] {
   }
 }
 
-export function parseVoiceLinesJson(responseText: string): JsonRecord[] {
-  let jsonText = responseText.trim()
-  jsonText = jsonText.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '')
-  const firstBracket = jsonText.indexOf('[')
-  const lastBracket = jsonText.lastIndexOf(']')
-  if (firstBracket === -1 || lastBracket === -1 || lastBracket <= firstBracket) {
-    throw new Error('voice_analyze: invalid JSON array')
+function parseStringArray(raw: string | null): string[] {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.map((item) => (typeof item === 'string' ? item : '')).filter(Boolean)
+  } catch {
+    return []
   }
-  const parsed = JSON.parse(jsonText.slice(firstBracket, lastBracket + 1))
-  if (!Array.isArray(parsed)) {
+}
+
+export function parseVoiceLinesJson(responseText: string): JsonRecord[] {
+  const rows = safeParseJsonArray(responseText)
+  if (rows.length === 0) {
+    const raw = safeParseJson(responseText)
+    if (Array.isArray(raw) && raw.length === 0) {
+      return []
+    }
     throw new Error('voice_analyze: invalid payload')
   }
-  return parsed.filter((item): item is JsonRecord => typeof item === 'object' && item !== null)
+  return rows as JsonRecord[]
 }
 
 export function asJsonRecord(value: unknown): JsonRecord | null {
@@ -74,6 +84,7 @@ export function buildStoryboardJson(storyboards: PersistedStoryboard[]) {
     text_segment: string
     description: string
     characters: string[]
+    props: string[]
   }> = []
 
   for (const storyboard of storyboards) {
@@ -84,6 +95,7 @@ export function buildStoryboardJson(storyboards: PersistedStoryboard[]) {
         text_segment: panel.srtSegment || '',
         description: panel.description || '',
         characters: parsePanelCharacters(panel.characters),
+        props: parseStringArray(panel.props),
       })
     }
   }
@@ -97,26 +109,53 @@ export async function persistStoryboardsAndPanels(params: {
   clipPanels: ClipPanelsResult[]
 }) {
   const { episodeId, clipPanels } = params
+  type PanelRow = {
+    id: string
+    panelIndex: number
+    description: string | null
+    srtSegment: string | null
+    characters: string | null
+    props: string | null
+  }
   return await prisma.$transaction(async (tx) => {
-    await tx.novelPromotionStoryboard.deleteMany({
-      where: { episodeId },
-    })
-
     const persisted: PersistedStoryboard[] = []
     for (const clipEntry of clipPanels) {
-      const storyboard = await tx.novelPromotionStoryboard.create({
-        data: {
+      const storyboard = await tx.novelPromotionStoryboard.upsert({
+        where: { clipId: clipEntry.clipId },
+        create: {
           clipId: clipEntry.clipId,
           episodeId,
           panelCount: clipEntry.finalPanels.length,
         },
+        update: {
+          panelCount: clipEntry.finalPanels.length,
+          episodeId,
+          lastError: null,
+        },
         select: { id: true, clipId: true },
       })
 
+      await tx.novelPromotionPanel.deleteMany({
+        where: { storyboardId: storyboard.id },
+      })
+
+      const panelModel = tx.novelPromotionPanel as unknown as {
+        create: (args: {
+          data: Record<string, unknown>
+          select: {
+            id: true
+            panelIndex: true
+            description: true
+            srtSegment: true
+            characters: true
+            props: true
+          }
+        }) => Promise<PanelRow>
+      }
       const persistedPanels: PersistedStoryboard['panels'] = []
       for (let i = 0; i < clipEntry.finalPanels.length; i += 1) {
         const panel = clipEntry.finalPanels[i]
-        const created = await tx.novelPromotionPanel.create({
+        const created = await panelModel.create({
           data: {
             storyboardId: storyboard.id,
             panelIndex: i,
@@ -127,6 +166,7 @@ export async function persistStoryboardsAndPanels(params: {
             videoPrompt: panel.video_prompt || null,
             location: panel.location || null,
             characters: panel.characters ? JSON.stringify(panel.characters) : null,
+            props: panel.props ? JSON.stringify(panel.props) : null,
             srtSegment: panel.source_text || null,
             photographyRules: panel.photographyPlan ? JSON.stringify(panel.photographyPlan) : null,
             actingNotes: panel.actingNotes ? JSON.stringify(panel.actingNotes) : null,
@@ -138,6 +178,7 @@ export async function persistStoryboardsAndPanels(params: {
             description: true,
             srtSegment: true,
             characters: true,
+            props: true,
           },
         })
         persistedPanels.push(created)

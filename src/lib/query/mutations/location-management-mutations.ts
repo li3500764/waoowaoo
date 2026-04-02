@@ -4,6 +4,7 @@ import type { Project } from '@/types/project'
 import { queryKeys } from '../keys'
 import type { ProjectAssetsData } from '../hooks/useProjectAssets'
 import { resolveTaskResponse } from '@/lib/task/client'
+import { apiFetch } from '@/lib/api-fetch'
 import {
     clearTaskTargetOverlay,
     upsertTaskTargetOverlay,
@@ -101,20 +102,26 @@ export function useUpdateProjectLocationName(projectId: string) {
 
     return useMutation({
         mutationFn: async ({ locationId, name }: { locationId: string; name: string }) => {
-            const res = await requestJsonWithError(`/api/novel-promotion/${projectId}/location`, {
+            const res = await requestJsonWithError(`/api/assets/${locationId}`, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ locationId, name })
+                body: JSON.stringify({
+                    scope: 'project',
+                    kind: 'location',
+                    projectId,
+                    name,
+                })
             }, 'Failed to update location name')
 
             // 等待图片标签更新完成，确保 onSuccess invalidate 后前端能立即看到新标签
             try {
-                await fetch(`/api/novel-promotion/${projectId}/update-asset-label`, {
+                await apiFetch(`/api/assets/${locationId}/update-label`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        type: 'location',
-                        id: locationId,
+                        scope: 'project',
+                        kind: 'location',
+                        projectId,
                         newName: name
                     })
                 })
@@ -232,6 +239,7 @@ export function useCreateProjectLocation(projectId: string) {
             name: string
             description: string
             artStyle?: string
+            count?: number
         }) =>
             await requestJsonWithError(
                 `/api/novel-promotion/${projectId}/location`,
@@ -280,12 +288,13 @@ export function useBatchGenerateLocationImages(projectId: string) {
         mutationFn: async (locationIds: string[]) => {
             const results = await Promise.allSettled(
                 locationIds.map(locationId =>
-                    fetch(`/api/novel-promotion/${projectId}/generate-image`, {
+                    apiFetch(`/api/assets/${locationId}/generate`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            type: 'location',
-                            id: locationId
+                            scope: 'project',
+                            kind: 'location',
+                            projectId,
                         })
                     })
                 )

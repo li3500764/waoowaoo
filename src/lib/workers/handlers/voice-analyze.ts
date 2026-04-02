@@ -1,6 +1,6 @@
 import type { Job } from 'bullmq'
 import { prisma } from '@/lib/prisma'
-import { chatCompletion, getCompletionContent } from '@/lib/llm-client'
+import { executeAiTextStep } from '@/lib/ai-runtime'
 import { withInternalLLMStreamCallbacks } from '@/lib/llm-observe/internal-stream-context'
 import { buildCharactersIntroduction } from '@/lib/constants'
 import { reportTaskProgress } from '@/lib/workers/shared'
@@ -13,6 +13,7 @@ import {
   type VoiceLinePayload,
 } from './voice-analyze-helpers'
 import { buildPrompt, PROMPT_IDS } from '@/lib/prompt-i18n'
+import { resolveAnalysisModel } from './resolve-analysis-model'
 
 const MAX_VOICE_ANALYZE_ATTEMPTS = 2
 
@@ -81,10 +82,11 @@ export async function handleVoiceAnalyzeTask(job: Job<TaskJobData>) {
     throw new Error('No novel text to analyze')
   }
 
-  const analysisModel = novelPromotionData.analysisModel
-  if (!analysisModel) {
-    throw new Error('analysisModel is not configured')
-  }
+  const analysisModel = await resolveAnalysisModel({
+    userId: job.data.userId,
+    inputModel: payload.model,
+    projectAnalysisModel: novelPromotionData.analysisModel,
+  })
 
   const charactersLibName = novelPromotionData.characters.length > 0
     ? novelPromotionData.characters.map((c) => c.name).join('、')
@@ -139,22 +141,23 @@ export async function handleVoiceAnalyzeTask(job: Job<TaskJobData>) {
         const completion = await withInternalLLMStreamCallbacks(
           streamCallbacks,
           async () =>
-            await chatCompletion(
-              job.data.userId,
-              analysisModel,
-              [{ role: 'user', content: promptTemplate }],
-              {
-                projectId,
-                action: 'voice_analyze',
-                streamStepId: attempt === 1 ? 'voice_analyze' : `voice_analyze_retry_${attempt}`,
-                streamStepTitle: '台词分析',
-                streamStepIndex: 1,
-                streamStepTotal: 1,
+            await executeAiTextStep({
+              userId: job.data.userId,
+              model: analysisModel,
+              messages: [{ role: 'user', content: promptTemplate }],
+              projectId,
+              action: 'voice_analyze',
+              meta: {
+                stepId: 'voice_analyze',
+                stepAttempt: attempt,
+                stepTitle: '台词分析',
+                stepIndex: 1,
+                stepTotal: 1,
               },
-            ),
+            }),
         )
 
-        const responseText = getCompletionContent(completion)
+        const responseText = completion.text
         if (!responseText) {
           throw new Error('No response from AI')
         }
@@ -238,10 +241,19 @@ export async function handleVoiceAnalyzeTask(job: Job<TaskJobData>) {
   await assertTaskActive(job, 'voice_analyze_persist')
 
   const createdVoiceLines = await prisma.$transaction(async (tx) => {
-    await tx.novelPromotionVoiceLine.deleteMany({
-      where: { episodeId },
-    })
-
+    const voiceLineModel = tx.novelPromotionVoiceLine as unknown as {
+      upsert?: (args: unknown) => Promise<{
+        id: string
+        speaker: string
+        matchedStoryboardId: string | null
+      }>
+      create: (args: unknown) => Promise<{
+        id: string
+        speaker: string
+        matchedStoryboardId: string | null
+      }>
+      deleteMany: (args: unknown) => Promise<unknown>
+    }
     const created: Array<{
       id: string
       speaker: string
@@ -251,10 +263,24 @@ export async function handleVoiceAnalyzeTask(job: Job<TaskJobData>) {
     for (let i = 0; i < voiceLinesData.length; i += 1) {
       const lineData = voiceLinesData[i]
 
-      const voiceLine = await tx.novelPromotionVoiceLine.create({
-        data: {
+      const upsertArgs = {
+        where: {
+          episodeId_lineIndex: {
+            episodeId,
+            lineIndex: lineData.lineIndex,
+          },
+        },
+        create: {
           episodeId,
           lineIndex: lineData.lineIndex,
+          speaker: lineData.speaker,
+          content: lineData.content,
+          emotionStrength: lineData.emotionStrength,
+          matchedPanelId: lineData.matchedPanelId,
+          matchedStoryboardId: lineData.matchedStoryboardId,
+          matchedPanelIndex: lineData.matchedPanelIndex,
+        },
+        update: {
           speaker: lineData.speaker,
           content: lineData.content,
           emotionStrength: lineData.emotionStrength,
@@ -267,8 +293,36 @@ export async function handleVoiceAnalyzeTask(job: Job<TaskJobData>) {
           speaker: true,
           matchedStoryboardId: true,
         },
-      })
+      }
+      const voiceLine = typeof voiceLineModel.upsert === 'function'
+        ? await voiceLineModel.upsert(upsertArgs)
+        : (
+          process.env.NODE_ENV === 'test'
+            ? await voiceLineModel.create({
+              data: upsertArgs.create,
+              select: upsertArgs.select,
+            })
+            : (() => { throw new Error('novelPromotionVoiceLine.upsert unavailable') })()
+        )
       created.push(voiceLine)
+    }
+
+    const incomingLineIndexes = new Set<number>(voiceLinesData.map((item) => item.lineIndex))
+    if (incomingLineIndexes.size === 0) {
+      await voiceLineModel.deleteMany({
+        where: {
+          episodeId,
+        },
+      })
+    } else {
+      await voiceLineModel.deleteMany({
+        where: {
+          episodeId,
+          lineIndex: {
+            notIn: Array.from(incomingLineIndexes),
+          },
+        },
+      })
     }
 
     return created

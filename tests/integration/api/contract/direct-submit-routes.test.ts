@@ -23,6 +23,7 @@ type DirectRouteCase = {
   expectedTaskType: TaskType
   expectedTargetType: string
   expectedProjectId: string
+  expectedPayloadSubset?: Record<string, unknown>
 }
 
 const authState = vi.hoisted<AuthState>(() => ({
@@ -30,7 +31,7 @@ const authState = vi.hoisted<AuthState>(() => ({
   projectMode: 'novel-promotion',
 }))
 
-const submitTaskMock = vi.hoisted(() => vi.fn<[], Promise<SubmitResult>>())
+const submitTaskMock = vi.hoisted(() => vi.fn<(...args: unknown[]) => Promise<SubmitResult>>())
 
 const configServiceMock = vi.hoisted(() => ({
   getUserModelConfig: vi.fn(async () => ({
@@ -75,6 +76,17 @@ const prismaMock = vi.hoisted(() => ({
   userPreference: {
     findUnique: vi.fn(async () => ({ lipSyncModel: 'fal::lipsync-model' })),
   },
+  novelPromotionStoryboard: {
+    findUnique: vi.fn(async () => ({
+      id: 'storyboard-1',
+      episode: {
+        novelPromotionProject: {
+          projectId: 'project-1',
+        },
+      },
+    })),
+    update: vi.fn(async () => ({})),
+  },
   novelPromotionPanel: {
     findFirst: vi.fn(async () => ({ id: 'panel-1' })),
     findMany: vi.fn(async () => []),
@@ -83,6 +95,7 @@ const prismaMock = vi.hoisted(() => ({
       if (id === 'panel-src') {
         return {
           id,
+          storyboardId: 'storyboard-1',
           panelIndex: 1,
           shotType: 'wide',
           cameraMove: 'static',
@@ -97,6 +110,7 @@ const prismaMock = vi.hoisted(() => ({
       if (id === 'panel-ins') {
         return {
           id,
+          storyboardId: 'storyboard-1',
           panelIndex: 2,
           shotType: 'medium',
           cameraMove: 'push',
@@ -110,6 +124,7 @@ const prismaMock = vi.hoisted(() => ({
       }
       return {
         id,
+        storyboardId: 'storyboard-1',
         panelIndex: 0,
         shotType: 'medium',
         cameraMove: 'static',
@@ -123,6 +138,10 @@ const prismaMock = vi.hoisted(() => ({
     }),
     update: vi.fn(async () => ({})),
     create: vi.fn(async () => ({ id: 'panel-created', panelIndex: 3 })),
+    findUniqueOrThrow: vi.fn(),
+    delete: vi.fn(async () => ({})),
+    count: vi.fn(async () => 3),
+    updateMany: vi.fn(async () => ({ count: 0 })),
   },
   novelPromotionProject: {
     findUnique: vi.fn(async () => ({
@@ -152,14 +171,31 @@ const prismaMock = vi.hoisted(() => ({
     novelPromotionPanel: {
       findMany: (args: unknown) => Promise<Array<{ id: string; panelIndex: number }>>
       update: (args: unknown) => Promise<unknown>
-      create: (args: unknown) => Promise<{ id: string; panelIndex: number }>
+      create: (args: { data?: { id?: string; panelIndex?: number } }) => Promise<{ id: string; panelIndex: number }>
+      findFirst: (args: unknown) => Promise<{ panelIndex: number } | null>
+      delete: (args: unknown) => Promise<unknown>
+      count: (args: unknown) => Promise<number>
+      updateMany: (args: unknown) => Promise<{ count: number }>
+    }
+    novelPromotionStoryboard: {
+      update: (args: unknown) => Promise<unknown>
     }
   }) => Promise<unknown>) => {
     const tx = {
       novelPromotionPanel: {
         findMany: async () => [],
         update: async () => ({}),
-        create: async () => ({ id: 'panel-created', panelIndex: 3 }),
+        create: async (args: { data?: { id?: string; panelIndex?: number } }) => ({
+          id: args.data?.id || 'panel-created',
+          panelIndex: args.data?.panelIndex ?? 3,
+        }),
+        findFirst: async () => ({ panelIndex: 3 }),
+        delete: async () => ({}),
+        count: async () => 3,
+        updateMany: async () => ({ count: 0 }),
+      },
+      novelPromotionStoryboard: {
+        update: async () => ({}),
       },
     }
     return await fn(tx)
@@ -206,7 +242,7 @@ vi.mock('@/lib/task/has-output', () => hasOutputMock)
 vi.mock('@/lib/billing', () => ({
   buildDefaultTaskBillingInfo: vi.fn(() => ({ mode: 'default' })),
 }))
-vi.mock('@/lib/qwen-voice-design', () => ({
+vi.mock('@/lib/providers/bailian/voice-design', () => ({
   validateVoicePrompt: vi.fn(() => ({ valid: true })),
   validatePreviewText: vi.fn(() => ({ valid: true })),
 }))
@@ -229,16 +265,35 @@ vi.mock('@/lib/api-config', () => ({
   resolveModelSelection: vi.fn(async () => ({
     model: 'img::storyboard',
   })),
+  resolveModelSelectionOrSingle: vi.fn(async (_userId: string, model: string | null | undefined) => {
+    const modelKey = typeof model === 'string' && model.trim().length > 0
+      ? model.trim()
+      : 'fal::audio-model'
+    const separator = modelKey.indexOf('::')
+    const provider = separator === -1 ? modelKey : modelKey.slice(0, separator)
+    const modelId = separator === -1 ? modelKey : modelKey.slice(separator + 2)
+    return {
+      provider,
+      modelId,
+      modelKey,
+      mediaType: 'audio',
+    }
+  }),
+  getProviderKey: vi.fn((providerId: string) => {
+    const marker = providerId.indexOf(':')
+    return marker === -1 ? providerId : providerId.slice(0, marker)
+  }),
 }))
 vi.mock('@/lib/prisma', () => ({
   prisma: prismaMock,
 }))
 
-function toApiPath(routeFile: string): string {
+function toApiPath(routeFile: string, params?: Record<string, string>): string {
   return routeFile
     .replace(/^src\/app/, '')
     .replace(/\/route\.ts$/, '')
-    .replace('[projectId]', 'project-1')
+    .replace('[projectId]', params?.projectId || 'project-1')
+    .replace('[assetId]', params?.assetId || 'asset-1')
 }
 
 function toModuleImportPath(routeFile: string): string {
@@ -248,7 +303,7 @@ function toModuleImportPath(routeFile: string): string {
 const DIRECT_CASES: ReadonlyArray<DirectRouteCase> = [
   {
     routeFile: 'src/app/api/asset-hub/generate-image/route.ts',
-    body: { type: 'character', id: 'global-character-1', appearanceIndex: 0 },
+    body: { type: 'character', id: 'global-character-1', appearanceIndex: 0, artStyle: 'realistic' },
     expectedTaskType: TASK_TYPE.ASSET_HUB_IMAGE,
     expectedTargetType: 'GlobalCharacter',
     expectedProjectId: 'global-asset-hub',
@@ -266,6 +321,62 @@ const DIRECT_CASES: ReadonlyArray<DirectRouteCase> = [
     expectedTaskType: TASK_TYPE.ASSET_HUB_MODIFY,
     expectedTargetType: 'GlobalCharacterAppearance',
     expectedProjectId: 'global-asset-hub',
+  },
+  {
+    routeFile: 'src/app/api/assets/[assetId]/generate/route.ts',
+    body: {
+      scope: 'global',
+      kind: 'character',
+      appearanceIndex: 0,
+      artStyle: 'realistic',
+    },
+    params: { assetId: 'global-character-1' },
+    expectedTaskType: TASK_TYPE.ASSET_HUB_IMAGE,
+    expectedTargetType: 'GlobalCharacter',
+    expectedProjectId: 'global-asset-hub',
+  },
+  {
+    routeFile: 'src/app/api/assets/[assetId]/generate/route.ts',
+    body: {
+      scope: 'project',
+      kind: 'character',
+      projectId: 'project-1',
+      appearanceId: 'appearance-1',
+    },
+    params: { assetId: 'character-1' },
+    expectedTaskType: TASK_TYPE.IMAGE_CHARACTER,
+    expectedTargetType: 'CharacterAppearance',
+    expectedProjectId: 'project-1',
+  },
+  {
+    routeFile: 'src/app/api/assets/[assetId]/modify-render/route.ts',
+    body: {
+      scope: 'global',
+      kind: 'character',
+      modifyPrompt: 'sharpen details',
+      appearanceIndex: 0,
+      imageIndex: 0,
+      extraImageUrls: ['https://example.com/ref-a.png'],
+    },
+    params: { assetId: 'global-character-1' },
+    expectedTaskType: TASK_TYPE.ASSET_HUB_MODIFY,
+    expectedTargetType: 'GlobalCharacterAppearance',
+    expectedProjectId: 'global-asset-hub',
+  },
+  {
+    routeFile: 'src/app/api/assets/[assetId]/modify-render/route.ts',
+    body: {
+      scope: 'project',
+      kind: 'character',
+      projectId: 'project-1',
+      appearanceId: 'appearance-1',
+      modifyPrompt: 'enhance texture',
+      extraImageUrls: ['https://example.com/ref-b.png'],
+    },
+    params: { assetId: 'character-1' },
+    expectedTaskType: TASK_TYPE.MODIFY_ASSET_IMAGE,
+    expectedTargetType: 'CharacterAppearance',
+    expectedProjectId: 'project-1',
   },
   {
     routeFile: 'src/app/api/asset-hub/voice-design/route.ts',
@@ -297,6 +408,11 @@ const DIRECT_CASES: ReadonlyArray<DirectRouteCase> = [
     expectedTaskType: TASK_TYPE.INSERT_PANEL,
     expectedTargetType: 'NovelPromotionStoryboard',
     expectedProjectId: 'project-1',
+    expectedPayloadSubset: {
+      storyboardId: 'storyboard-1',
+      insertAfterPanelId: 'panel-ins',
+      userInput: '请根据前后镜头自动分析并插入一个自然衔接的新分镜。',
+    },
   },
   {
     routeFile: 'src/app/api/novel-promotion/[projectId]/lip-sync/route.ts',
@@ -407,7 +523,7 @@ async function invokePostRoute(routeCase: DirectRouteCase): Promise<Response> {
   const mod = await import(modulePath)
   const post = mod.POST as (request: Request, context?: RouteContext) => Promise<Response>
   const req = buildMockRequest({
-    path: toApiPath(routeCase.routeFile),
+    path: toApiPath(routeCase.routeFile, routeCase.params),
     method: 'POST',
     body: routeCase.body,
   })
@@ -427,7 +543,7 @@ describe('api contract - direct submit routes (behavior)', () => {
   })
 
   it('keeps expected coverage size', () => {
-    expect(DIRECT_CASES.length).toBe(16)
+    expect(DIRECT_CASES.length).toBe(20)
   })
 
   for (const routeCase of DIRECT_CASES) {
@@ -453,6 +569,9 @@ describe('api contract - direct submit routes (behavior)', () => {
       expect(submitArg?.targetType).toBe(routeCase.expectedTargetType)
       expect(submitArg?.projectId).toBe(routeCase.expectedProjectId)
       expect(submitArg?.userId).toBe('user-1')
+      if (routeCase.expectedPayloadSubset) {
+        expect(submitArg?.payload).toEqual(expect.objectContaining(routeCase.expectedPayloadSubset))
+      }
 
       const json = await res.json() as Record<string, unknown>
       const isVoiceGenerateRoute = routeCase.routeFile.endsWith('/voice-generate/route.ts')

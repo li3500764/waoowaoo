@@ -4,6 +4,8 @@ import { useTranslations } from 'next-intl'
 import TaskStatusInline from '@/components/task/TaskStatusInline'
 import type { TaskPresentationState } from '@/lib/task/presentation'
 import { AppIcon } from '@/components/ui/icons'
+import ImageGenerationInlineCountButton from '@/components/image-generation/ImageGenerationInlineCountButton'
+import { getImageGenerationCountOptions } from '@/lib/image-generation/count'
 
 type LocationCardActionsProps =
   | {
@@ -17,8 +19,10 @@ type LocationCardActionsProps =
     mode: 'compact'
     currentImageUrl: string | null | undefined
     isTaskRunning: boolean
-    hasDescription: boolean
-    onGenerate: () => void
+    canGenerate: boolean
+    generationCount: number
+    onGenerationCountChange: (value: number) => void
+    onGenerate: (count?: number) => void
   }
 
 export default function LocationCardActions(props: LocationCardActionsProps) {
@@ -56,14 +60,18 @@ export default function LocationCardActions(props: LocationCardActionsProps) {
 
   return (
     !props.currentImageUrl && !props.isTaskRunning && (
-      <button
-        type="button"
-        onClick={props.onGenerate}
-        disabled={!props.hasDescription}
-        className="glass-btn-base glass-btn-primary w-full py-1 text-xs disabled:opacity-50"
-      >
-        {t('common.generate')}
-      </button>
+      <ImageGenerationInlineCountButton
+        prefix={<span>{t('image.generateCountPrefix')}</span>}
+        suffix={<span>{t('image.generateCountSuffix')}</span>}
+        value={props.generationCount}
+        options={getImageGenerationCountOptions('location')}
+        onValueChange={props.onGenerationCountChange}
+        onClick={() => props.onGenerate(props.generationCount)}
+        disabled={!props.canGenerate}
+        ariaLabel={t('image.selectCount')}
+        className="glass-btn-base glass-btn-primary flex w-full items-center justify-center gap-1 py-1 text-xs disabled:opacity-50"
+        selectClassName="appearance-none bg-transparent border-0 pl-0 pr-3 text-xs font-semibold text-current outline-none cursor-pointer leading-none transition-colors"
+      />
     )
   )
 }

@@ -1,6 +1,6 @@
 import type { Job } from 'bullmq'
 import { prisma } from '@/lib/prisma'
-import { chatCompletion, getCompletionContent } from '@/lib/llm-client'
+import { executeAiTextStep } from '@/lib/ai-runtime'
 import { encodeImageUrls } from '@/lib/contracts/image-urls-contract'
 import { validateProfileData, stringifyProfileData } from '@/types/character-profile'
 import { withInternalLLMStreamCallbacks } from '@/lib/llm-observe/internal-stream-context'
@@ -89,25 +89,25 @@ async function handleConfirmProfile(
   const completion = await withInternalLLMStreamCallbacks(
     streamCallbacks,
     async () =>
-      await chatCompletion(
-        job.data.userId,
-        project.novelPromotionData!.analysisModel!,
-        [{ role: 'user', content: promptTemplate }],
-        {
-          temperature: 0.7,
-          projectId: job.data.projectId,
-          action: 'generate_character_visual',
-          streamStepId: 'character_profile_confirm',
-          streamStepTitle: '角色档案确认',
-          streamStepIndex: 1,
-          streamStepTotal: 1,
+      await executeAiTextStep({
+        userId: job.data.userId,
+        model: project.novelPromotionData!.analysisModel!,
+        messages: [{ role: 'user', content: promptTemplate }],
+        temperature: 0.7,
+        projectId: job.data.projectId,
+        action: 'generate_character_visual',
+        meta: {
+          stepId: 'character_profile_confirm',
+          stepTitle: '角色档案确认',
+          stepIndex: 1,
+          stepTotal: 1,
         },
-      ),
+      }),
   )
   await streamCallbacks.flush()
   await assertTaskActive(job, 'character_profile_confirm_parse')
 
-  const responseText = getCompletionContent(completion)
+  const responseText = completion.text
   const visualData = parseVisualResponse(responseText)
   const visualCharacters = Array.isArray(visualData.characters)
     ? (visualData.characters as Array<AnyObj>)
@@ -129,27 +129,50 @@ async function handleConfirmProfile(
   }
   await assertTaskActive(job, 'character_profile_confirm_persist')
 
+  const appearanceRows: Array<{
+    characterId: string
+    appearanceIndex: number
+    changeReason: string
+    description: string
+    descriptions: string
+    imageUrls: string
+    previousImageUrls: string
+  }> = []
+
   for (let appIndex = 0; appIndex < appearances.length; appIndex++) {
     const app = appearances[appIndex]
     await assertTaskActive(job, 'character_profile_confirm_create_appearance')
     const descriptions = Array.isArray(app.descriptions) ? app.descriptions : []
     const normalizedDescriptions = descriptions.map((item) => readText(item)).filter(Boolean)
-    await prisma.characterAppearance.create({
-      data: {
-        characterId: character.id,
-        appearanceIndex: appIndex,
-        changeReason: readText(app.change_reason) || '初始形象',
-        description: normalizedDescriptions[0] || '',
-        descriptions: JSON.stringify(normalizedDescriptions),
-        imageUrls: encodeImageUrls([]),
-        previousImageUrls: encodeImageUrls([]),
-      },
+    appearanceRows.push({
+      characterId: character.id,
+      appearanceIndex: appIndex,
+      changeReason: readText(app.change_reason) || '初始形象',
+      description: normalizedDescriptions[0] || '',
+      descriptions: JSON.stringify(normalizedDescriptions),
+      imageUrls: encodeImageUrls([]),
+      previousImageUrls: encodeImageUrls([]),
     })
   }
 
-  await prisma.novelPromotionCharacter.update({
-    where: { id: characterId },
-    data: { profileConfirmed: true },
+  await prisma.$transaction(async (tx) => {
+    await tx.characterAppearance.deleteMany({
+      where: { characterId: character.id },
+    })
+
+    for (const appearanceRow of appearanceRows) {
+      await tx.characterAppearance.create({
+        data: appearanceRow,
+      })
+    }
+
+    await tx.novelPromotionCharacter.update({
+      where: { id: characterId },
+      data: {
+        profileData: finalProfileData,
+        profileConfirmed: true,
+      },
+    })
   })
 
   if (!suppressProgress) {

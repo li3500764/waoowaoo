@@ -1,6 +1,7 @@
 import { type Job } from 'bullmq'
 import { prisma } from '@/lib/prisma'
-import { addLocationPromptSuffix, getArtStylePrompt } from '@/lib/constants'
+import { addLocationPromptSuffix, getArtStylePrompt, isArtStyleValue, type ArtStyleValue } from '@/lib/constants'
+import { normalizeImageGenerationCount } from '@/lib/image-generation/count'
 import { type TaskJobData } from '@/lib/task/types'
 import { reportTaskProgress } from '../shared'
 import {
@@ -12,6 +13,15 @@ import {
   generateLabeledImageToCos,
   pickFirstString,
 } from './image-task-handler-shared'
+
+function resolvePayloadArtStyle(payload: AnyObj): ArtStyleValue | undefined {
+  if (!Object.prototype.hasOwnProperty.call(payload, 'artStyle')) return undefined
+  const parsedArtStyle = typeof payload.artStyle === 'string' ? payload.artStyle.trim() : ''
+  if (!isArtStyleValue(parsedArtStyle)) {
+    throw new Error('Invalid artStyle in IMAGE_LOCATION payload')
+  }
+  return parsedArtStyle
+}
 
 interface LocationImageRecord {
   id: string
@@ -38,6 +48,11 @@ interface LocationImageTaskDb {
   }
 }
 
+function resolveRequestedLocationCount(payload: AnyObj): number | null {
+  if (!Object.prototype.hasOwnProperty.call(payload, 'count')) return null
+  return normalizeImageGenerationCount('location', payload.count)
+}
+
 export async function handleLocationImageTask(job: Job<TaskJobData>) {
   const payload = (job.data.payload || {}) as AnyObj
   const projectId = job.data.projectId
@@ -46,8 +61,10 @@ export async function handleLocationImageTask(job: Job<TaskJobData>) {
   const models = await getProjectModels(projectId, userId)
   const modelId = models.locationModel
   if (!modelId) throw new Error('Location model not configured')
+  const requestedCount = resolveRequestedLocationCount(payload)
 
-  const artStyle = getArtStylePrompt(models.artStyle, job.data.locale)
+  const payloadArtStyle = resolvePayloadArtStyle(payload)
+  const artStyle = getArtStylePrompt(payloadArtStyle ?? models.artStyle, job.data.locale)
 
   // targetId may be locationId (group) or locationImageId (single)
   const maybeLocationImage = await db.locationImage.findUnique({
@@ -74,7 +91,8 @@ export async function handleLocationImageTask(job: Job<TaskJobData>) {
       if (location?.name) {
         locationNameMap[maybeLocationImage.locationId] = location.name
       }
-      locationImages = location?.images || [maybeLocationImage]
+      const orderedImages = location?.images || [maybeLocationImage]
+      locationImages = requestedCount === null ? orderedImages : orderedImages.slice(0, requestedCount)
     }
   } else {
     const locationId = pickFirstString(payload.id, payload.locationId, job.data.targetId)
@@ -97,7 +115,7 @@ export async function handleLocationImageTask(job: Job<TaskJobData>) {
       if (!image) throw new Error(`Location image not found for imageIndex=${payload.imageIndex}`)
       locationImages = [image]
     } else {
-      locationImages = location.images
+      locationImages = requestedCount === null ? location.images : location.images.slice(0, requestedCount)
     }
   }
 

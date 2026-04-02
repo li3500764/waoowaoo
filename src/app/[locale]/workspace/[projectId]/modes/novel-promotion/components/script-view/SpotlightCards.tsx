@@ -80,14 +80,28 @@ export function SpotlightCharCard({
     <div
       onClick={onClick}
       className={`
-        group relative rounded-xl cursor-pointer transition-all duration-500 ease-out
+        group relative min-w-0 rounded-xl cursor-pointer transition-all duration-500 ease-out
         ${isActive
           ? 'opacity-100 scale-100 ring-2 ring-[var(--glass-focus-ring-strong)] shadow-[var(--glass-shadow-md)] bg-[var(--glass-bg-surface)]'
           : 'opacity-50 scale-95 grayscale hover:grayscale-0 hover:opacity-100 hover:scale-95 bg-[var(--glass-bg-muted)]'
         }
       `}
     >
-      <div className="aspect-square relative bg-[var(--glass-bg-muted)]">
+      {isActive && onRemove && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation()
+            if (confirm(tScript('confirm.removeCharacter'))) {
+              onRemove()
+            }
+          }}
+          className="absolute right-2 top-2 h-5 w-5 rounded-full bg-[var(--glass-tone-danger-fg)] text-white text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all shadow-md hover:bg-[var(--glass-tone-danger-fg)] hover:scale-110 z-20"
+          title={tScript('asset.removeFromClip')}
+        >
+          <AppIcon name="closeSm" className="h-3 w-3" />
+        </button>
+      )}
+      <div className="aspect-square relative rounded-t-xl overflow-hidden bg-[var(--glass-bg-muted)]">
         {imageUrl ? (
           <MediaImageWithLoading
             src={imageUrl}
@@ -113,20 +127,6 @@ export function SpotlightCharCard({
         )}
         {isActive && (
           <div className="absolute top-2 right-2 w-2 h-2 bg-[var(--glass-tone-success-fg)] rounded-full shadow-[0_0_8px_rgba(74,222,128,0.8)] border border-white" />
-        )}
-        {isActive && onRemove && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation()
-              if (confirm(tScript('confirm.removeCharacter'))) {
-                onRemove()
-              }
-            }}
-            className="absolute top-0 right-0 translate-x-1/2 -translate-y-1/2 w-5 h-5 bg-[var(--glass-tone-danger-fg)] rounded-full text-white text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all shadow-md hover:bg-[var(--glass-tone-danger-fg)] hover:scale-110 z-20"
-            title={tScript('asset.removeFromClip')}
-          >
-            <AppIcon name="closeSm" className="h-3 w-3" />
-          </button>
         )}
       </div>
       <div className="p-2 text-center">
@@ -209,14 +209,28 @@ export function SpotlightLocationCard({
     <div
       onClick={onClick}
       className={`
-        group relative rounded-xl cursor-pointer transition-all duration-500 ease-out
+        group relative min-w-0 rounded-xl cursor-pointer transition-all duration-500 ease-out
         ${isActive
           ? 'opacity-100 scale-100 ring-2 ring-[var(--glass-stroke-success)] shadow-[var(--glass-shadow-md)] bg-[var(--glass-bg-surface)]'
           : 'opacity-50 scale-95 grayscale hover:grayscale-0 hover:opacity-100 hover:scale-95 bg-[var(--glass-bg-muted)]'
         }
       `}
     >
-      <div className="aspect-video relative bg-[var(--glass-bg-muted)]">
+      {isActive && onRemove && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation()
+            if (confirm(tScript('confirm.removeLocation'))) {
+              onRemove()
+            }
+          }}
+          className="absolute right-2 top-2 h-5 w-5 rounded-full bg-[var(--glass-tone-danger-fg)] text-white text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all shadow-md hover:bg-[var(--glass-tone-danger-fg)] hover:scale-110 z-20"
+          title={tScript('asset.removeFromClip')}
+        >
+          <AppIcon name="closeSm" className="h-3 w-3" />
+        </button>
+      )}
+      <div className="aspect-video relative rounded-t-xl overflow-hidden bg-[var(--glass-bg-muted)]">
         {imageUrl ? (
           <MediaImageWithLoading
             src={imageUrl}
@@ -242,20 +256,6 @@ export function SpotlightLocationCard({
         )}
         {isActive && (
           <div className="absolute top-2 right-2 w-2 h-2 bg-[var(--glass-tone-success-fg)] rounded-full shadow-[0_0_8px_rgba(74,222,128,0.8)] border border-white" />
-        )}
-        {isActive && onRemove && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation()
-              if (confirm(tScript('confirm.removeLocation'))) {
-                onRemove()
-              }
-            }}
-            className="absolute top-0 right-0 translate-x-1/2 -translate-y-1/2 w-5 h-5 bg-[var(--glass-tone-danger-fg)] rounded-full text-white text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all shadow-md hover:bg-[var(--glass-tone-danger-fg)] hover:scale-110 z-20"
-            title={tScript('asset.removeFromClip')}
-          >
-            <AppIcon name="closeSm" className="h-3 w-3" />
-          </button>
         )}
       </div>
       <div className="p-2 text-center">

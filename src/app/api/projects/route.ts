@@ -3,6 +3,7 @@ import { prisma } from '@/lib/prisma'
 import { requireUserAuth, isErrorResponse } from '@/lib/api-auth'
 import { apiHandler, ApiError } from '@/lib/api-errors'
 import { toMoneyNumber } from '@/lib/billing/money'
+import { isArtStyleValue } from '@/lib/constants'
 
 // GET - 获取用户的项目（支持分页和搜索）
 export const GET = apiHandler(async (request: NextRequest) => {
@@ -21,10 +22,11 @@ export const GET = apiHandler(async (request: NextRequest) => {
   const where: Record<string, unknown> = { userId: session.user.id }
 
   // 如果有搜索关键词，搜索名称和描述
+  // 注意：SQLite 不支持 mode: 'insensitive'，但 SQLite 的 LIKE 默认即大小写不敏感（ASCII 范围）
   if (search.trim()) {
     where.OR = [
-      { name: { contains: search.trim(), mode: 'insensitive' } },
-      { description: { contains: search.trim(), mode: 'insensitive' } }
+      { name: { contains: search.trim() } },
+      { description: { contains: search.trim() } }
     ]
   }
 
@@ -76,7 +78,8 @@ export const GET = apiHandler(async (request: NextRequest) => {
           select: {
             episodes: true,
             characters: true,
-            locations: true}
+            locations: true
+          }
         },
         episodes: {
           orderBy: { episodeNumber: 'asc' },
@@ -97,7 +100,8 @@ export const GET = apiHandler(async (request: NextRequest) => {
                   },
                   select: {
                     imageUrl: true,
-                    videoUrl: true}
+                    videoUrl: true
+                  }
                 }
               }
             }
@@ -135,7 +139,8 @@ export const GET = apiHandler(async (request: NextRequest) => {
         images: imageCount,
         videos: videoCount,
         panels: panelCount,
-        firstEpisodePreview: preview}]
+        firstEpisodePreview: preview
+      }]
     })
   )
 
@@ -143,7 +148,8 @@ export const GET = apiHandler(async (request: NextRequest) => {
   const projectsWithStats = projects.map(project => ({
     ...project,
     totalCost: costMap.get(project.id) ?? 0,
-    stats: statsMap.get(project.id) ?? { episodes: 0, images: 0, videos: 0, panels: 0, firstEpisodePreview: null }}))
+    stats: statsMap.get(project.id) ?? { episodes: 0, images: 0, videos: 0, panels: 0, firstEpisodePreview: null }
+  }))
 
   return NextResponse.json({
     projects: projectsWithStats,
@@ -207,8 +213,9 @@ export const POST = apiHandler(async (request: NextRequest) => {
         storyboardModel: userPreference.storyboardModel,
         editModel: userPreference.editModel,
         videoModel: userPreference.videoModel,
+        audioModel: userPreference.audioModel,
         videoRatio: userPreference.videoRatio,
-        artStyle: userPreference.artStyle || 'american-comic',
+        artStyle: isArtStyleValue(userPreference.artStyle) ? userPreference.artStyle : 'american-comic',
         ttsRate: userPreference.ttsRate
       })
     }

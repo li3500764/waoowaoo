@@ -1,5 +1,5 @@
 import type { Job } from 'bullmq'
-import { chatCompletion, getCompletionContent } from '@/lib/llm-client'
+import { executeAiTextStep } from '@/lib/ai-runtime'
 import { getUserModelConfig } from '@/lib/config-service'
 import { removeCharacterPromptSuffix, removeLocationPromptSuffix } from '@/lib/constants'
 import { withInternalLLMStreamCallbacks } from '@/lib/llm-observe/internal-stream-context'
@@ -17,15 +17,10 @@ function readRequiredString(value: unknown, field: string): string {
   return value.trim()
 }
 
-function parseJsonPrompt(responseText: string): string {
-  let cleaned = responseText.trim()
-  cleaned = cleaned.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '')
-  const jsonMatch = cleaned.match(/\{[\s\S]*\}/)
-  if (!jsonMatch) {
-    throw new Error('No JSON found in response')
-  }
+import { safeParseJsonObject } from '@/lib/json-repair'
 
-  const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>
+function parseJsonPrompt(responseText: string): string {
+  const parsed = safeParseJsonObject(responseText)
   const prompt = typeof parsed.prompt === 'string' ? parsed.prompt.trim() : ''
   if (!prompt) {
     throw new Error('No prompt field in response')
@@ -83,25 +78,25 @@ export async function handleAssetHubAIModifyTask(job: Job<TaskJobData>) {
   const completion = await withInternalLLMStreamCallbacks(
     streamCallbacks,
     async () =>
-      await chatCompletion(
-        job.data.userId,
-        userConfig.analysisModel!,
-        [{ role: 'user', content: finalPrompt }],
-        {
-          temperature: 0.7,
-          projectId: 'asset-hub',
-          action: isCharacter ? 'ai_modify_character' : 'ai_modify_location',
-          streamStepId: isCharacter ? 'asset_hub_ai_modify_character' : 'asset_hub_ai_modify_location',
-          streamStepTitle: isCharacter ? '角色描述修改' : '场景描述修改',
-          streamStepIndex: 1,
-          streamStepTotal: 1,
+      await executeAiTextStep({
+        userId: job.data.userId,
+        model: userConfig.analysisModel!,
+        messages: [{ role: 'user', content: finalPrompt }],
+        temperature: 0.7,
+        projectId: 'asset-hub',
+        action: isCharacter ? 'ai_modify_character' : 'ai_modify_location',
+        meta: {
+          stepId: isCharacter ? 'asset_hub_ai_modify_character' : 'asset_hub_ai_modify_location',
+          stepTitle: isCharacter ? '角色描述修改' : '场景描述修改',
+          stepIndex: 1,
+          stepTotal: 1,
         },
-      ),
+      }),
   )
   await streamCallbacks.flush()
   await assertTaskActive(job, 'asset_hub_ai_modify_parse')
 
-  const modifiedDescription = parseJsonPrompt(getCompletionContent(completion))
+  const modifiedDescription = parseJsonPrompt(completion.text)
 
   await reportTaskProgress(job, 96, {
     stage: 'asset_hub_ai_modify_done',

@@ -1,7 +1,13 @@
+import { safeParseJsonArray, safeParseJsonObject } from '@/lib/json-repair'
 import { buildCharactersIntroduction } from '@/lib/constants'
 import { normalizeAnyError } from '@/lib/errors/normalize'
 import { createScopedLogger } from '@/lib/logging/core'
 import { createClipContentMatcher, type ClipMatchLevel } from './clip-matching'
+import { mapWithConcurrency } from '@/lib/async/map-with-concurrency'
+import {
+  DEFAULT_ANALYSIS_WORKFLOW_CONCURRENCY,
+  normalizeWorkflowConcurrencyValue,
+} from '@/lib/workflow-concurrency'
 
 export type StoryToScriptStepMeta = {
   stepId: string
@@ -9,6 +15,11 @@ export type StoryToScriptStepMeta = {
   stepTitle: string
   stepIndex: number
   stepTotal: number
+  dependsOn?: string[]
+  groupId?: string
+  parallelKey?: string
+  retryable?: boolean
+  blockedBy?: string[]
 }
 
 export type StoryToScriptStepOutput = {
@@ -23,6 +34,7 @@ export type StoryToScriptClipCandidate = {
   summary: string
   location: string | null
   characters: string[]
+  props: string[]
   content: string
   matchLevel: ClipMatchLevel
   matchConfidence: number
@@ -39,14 +51,17 @@ export type StoryToScriptScreenplayResult = {
 export type StoryToScriptPromptTemplates = {
   characterPromptTemplate: string
   locationPromptTemplate: string
+  propPromptTemplate: string
   clipPromptTemplate: string
   screenplayPromptTemplate: string
 }
 
 export type StoryToScriptOrchestratorInput = {
+  concurrency?: number
   content: string
   baseCharacters: string[]
   baseLocations: string[]
+  baseProps?: string[]
   baseCharacterIntroductions: Array<{ name: string; introduction?: string | null }>
   promptTemplates: StoryToScriptPromptTemplates
   runStep: (
@@ -62,20 +77,25 @@ export type StoryToScriptOrchestratorInput = {
 export type StoryToScriptOrchestratorResult = {
   characterStep: StoryToScriptStepOutput
   locationStep: StoryToScriptStepOutput
+  propStep: StoryToScriptStepOutput
   splitStep: StoryToScriptStepOutput
   charactersObject: Record<string, unknown>
   locationsObject: Record<string, unknown>
+  propsObject: Record<string, unknown>
   analyzedCharacters: Record<string, unknown>[]
   analyzedLocations: Record<string, unknown>[]
+  analyzedProps: Record<string, unknown>[]
   charactersLibName: string
   locationsLibName: string
+  propsLibName: string
   charactersIntroduction: string
   clipList: StoryToScriptClipCandidate[]
   screenplayResults: StoryToScriptScreenplayResult[]
   summary: {
     characterCount: number
-    locationCount: number
-    clipCount: number
+      locationCount: number
+      propCount: number
+      clipCount: number
     screenplaySuccessCount: number
     screenplayFailedCount: number
     totalScenes: number
@@ -91,118 +111,12 @@ function applyTemplate(template: string, replacements: Record<string, string>) {
   return next
 }
 
-function parseJSONObject(responseText: string): Record<string, unknown> {
-  let cleaned = responseText.trim()
-  cleaned = cleaned
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/, '')
-    .replace(/\s*```$/g, '')
-    .trim()
-
-  const firstBrace = cleaned.indexOf('{')
-  const lastBrace = cleaned.lastIndexOf('}')
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    cleaned = cleaned.slice(firstBrace, lastBrace + 1)
-  }
-
-  return JSON.parse(cleaned) as Record<string, unknown>
-}
-
 function parseClipArray(responseText: string): Record<string, unknown>[] {
-  let cleaned = responseText.trim()
-  cleaned = cleaned
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/, '')
-    .replace(/\s*```$/g, '')
-    .trim()
-
-  const firstBracket = cleaned.indexOf('[')
-  const lastBracket = cleaned.lastIndexOf(']')
-  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
-    const parsed = JSON.parse(cleaned.slice(firstBracket, lastBracket + 1))
-    if (Array.isArray(parsed)) {
-      return parsed.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
-    }
-  }
-
-  const obj = parseJSONObject(cleaned)
-  const clips = obj.clips
-  if (Array.isArray(clips)) {
-    return clips.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object')
-  }
-
-  throw new Error('Invalid clip JSON format')
-}
-
-function escapeControlCharsInJsonStrings(input: string): string {
-  let out = ''
-  let inString = false
-  let escaped = false
-
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i]
-    if (!inString) {
-      if (ch === '"') inString = true
-      out += ch
-      continue
-    }
-    if (escaped) {
-      out += ch
-      escaped = false
-      continue
-    }
-    if (ch === '\\') {
-      out += ch
-      escaped = true
-      continue
-    }
-    if (ch === '"') {
-      inString = false
-      out += ch
-      continue
-    }
-    if (ch === '\n') {
-      out += '\\n'
-      continue
-    }
-    if (ch === '\r') {
-      out += '\\r'
-      continue
-    }
-    if (ch === '\t') {
-      out += '\\t'
-      continue
-    }
-    const code = ch.charCodeAt(0)
-    if (code < 0x20) {
-      out += `\\u${code.toString(16).padStart(4, '0')}`
-      continue
-    }
-    out += ch
-  }
-
-  return out
+  return safeParseJsonArray(responseText, 'clips')
 }
 
 function parseScreenplayObject(responseText: string): Record<string, unknown> {
-  let cleaned = responseText.trim()
-  cleaned = cleaned
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/, '')
-    .replace(/\s*```$/g, '')
-    .trim()
-
-  const firstBrace = cleaned.indexOf('{')
-  const lastBrace = cleaned.lastIndexOf('}')
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    cleaned = cleaned.slice(firstBrace, lastBrace + 1)
-  }
-
-  try {
-    return JSON.parse(cleaned) as Record<string, unknown>
-  } catch {
-    return JSON.parse(escapeControlCharsInJsonStrings(cleaned)) as Record<string, unknown>
-  }
+  return safeParseJsonObject(responseText)
 }
 
 function asString(value: unknown): string {
@@ -231,6 +145,10 @@ function extractAnalyzedLocations(obj: Record<string, unknown>): Record<string, 
   return toObjectArray(obj.locations)
 }
 
+function extractAnalyzedProps(obj: Record<string, unknown>): Record<string, unknown>[] {
+  return toObjectArray(obj.props)
+}
+
 const MAX_STEP_ATTEMPTS = 3
 const MAX_SPLIT_BOUNDARY_ATTEMPTS = 2
 const MAX_RETRY_DELAY_MS = 10_000
@@ -249,6 +167,19 @@ function computeRetryDelayMs(attempt: number) {
   const base = Math.min(1_000 * Math.pow(2, Math.max(0, attempt - 1)), MAX_RETRY_DELAY_MS)
   const jitter = Math.floor(Math.random() * 300)
   return base + jitter
+}
+
+function isRecoverableJsonParseError(error: unknown, normalizedMessage: string): boolean {
+  if (normalizedMessage.includes('ark responses 调用失败')) return false
+  if (normalizedMessage.includes('invalidparameter')) return false
+  if (normalizedMessage.includes('unknown field')) return false
+
+  if (error instanceof SyntaxError) return true
+
+  return normalizedMessage.includes('unexpected token')
+    || normalizedMessage.includes('unexpected end of json input')
+    || normalizedMessage.includes('json format invalid')
+    || normalizedMessage.includes('invalid clip json format')
 }
 
 async function runStepWithRetry<T>(
@@ -280,8 +211,7 @@ async function runStepWithRetry<T>(
       const shouldRetry = attempt < MAX_STEP_ATTEMPTS
         && (
           normalizedError.retryable
-          || lowerMessage.includes('json')
-          || lowerMessage.includes('parse')
+          || isRecoverableJsonParseError(error, lowerMessage)
         )
 
       orchestratorLogger.error({
@@ -315,18 +245,25 @@ export async function runStoryToScriptOrchestrator(
   input: StoryToScriptOrchestratorInput,
 ): Promise<StoryToScriptOrchestratorResult> {
   const {
+    concurrency: rawConcurrency,
     content,
     baseCharacters,
     baseLocations,
+    baseProps = [],
     baseCharacterIntroductions,
     promptTemplates,
     runStep,
     onStepError,
     onLog,
   } = input
+  const concurrency = normalizeWorkflowConcurrencyValue(
+    rawConcurrency,
+    DEFAULT_ANALYSIS_WORKFLOW_CONCURRENCY,
+  )
 
   const baseCharactersText = baseCharacters.length > 0 ? baseCharacters.join('、') : '无'
   const baseLocationsText = baseLocations.length > 0 ? baseLocations.join('、') : '无'
+  const basePropsText = baseProps.length > 0 ? baseProps.join('、') : '无'
   const baseCharacterInfo = baseCharacterIntroductions.length > 0
     ? baseCharacterIntroductions.map((item, index) => `${index + 1}. ${item.name}`).join('\n')
     : '暂无已有角色'
@@ -340,37 +277,81 @@ export async function runStoryToScriptOrchestrator(
     input: content,
     locations_lib_name: baseLocationsText,
   })
+  const propPrompt = applyTemplate(promptTemplates.propPromptTemplate, {
+    input: content,
+    props_lib_name: basePropsText,
+  })
 
-  onLog?.('开始步骤1：角色/场景分析（并行）')
-  const [
-    { output: characterStep, parsed: charactersObject },
-    { output: locationStep, parsed: locationsObject },
-  ] = await Promise.all([
-    runStepWithRetry(
-      runStep,
-      { stepId: 'analyze_characters', stepTitle: 'progress.streamStep.analyzeCharacters', stepIndex: 1, stepTotal: 2 },
-      characterPrompt,
-      'analyze_characters',
-      2200,
-      parseJSONObject,
-    ),
-    runStepWithRetry(
-      runStep,
-      { stepId: 'analyze_locations', stepTitle: 'progress.streamStep.analyzeLocations', stepIndex: 2, stepTotal: 2 },
-      locationPrompt,
-      'analyze_locations',
-      2200,
-      parseJSONObject,
-    ),
-  ])
+  onLog?.('开始步骤1：角色/场景/道具分析（并行）')
+  const analysisResults = await mapWithConcurrency(
+    [
+      () => runStepWithRetry(
+        runStep,
+        {
+          stepId: 'analyze_characters',
+          stepTitle: 'progress.streamStep.analyzeCharacters',
+          stepIndex: 1,
+          stepTotal: 2,
+          groupId: 'analysis',
+          parallelKey: 'characters',
+          retryable: true,
+        },
+        characterPrompt,
+        'analyze_characters',
+        2200,
+        safeParseJsonObject,
+      ),
+      () => runStepWithRetry(
+        runStep,
+        {
+          stepId: 'analyze_locations',
+          stepTitle: 'progress.streamStep.analyzeLocations',
+          stepIndex: 2,
+          stepTotal: 2,
+          groupId: 'analysis',
+          parallelKey: 'locations',
+          retryable: true,
+        },
+        locationPrompt,
+        'analyze_locations',
+        2200,
+        safeParseJsonObject,
+      ),
+      () => runStepWithRetry(
+        runStep,
+        {
+          stepId: 'analyze_props',
+          stepTitle: 'progress.streamStep.analyzeProps',
+          stepIndex: 3,
+          stepTotal: 3,
+          groupId: 'analysis',
+          parallelKey: 'props',
+          retryable: true,
+        },
+        propPrompt,
+        'analyze_props',
+        1600,
+        safeParseJsonObject,
+      ),
+    ],
+    concurrency,
+    async (run) => await run(),
+  )
+  const { output: characterStep, parsed: charactersObject } = analysisResults[0]
+  const { output: locationStep, parsed: locationsObject } = analysisResults[1]
+  const { output: propStep, parsed: propsObject } = analysisResults[2]
 
   const analyzedCharacters = extractAnalyzedCharacters(charactersObject)
   const analyzedLocations = extractAnalyzedLocations(locationsObject)
+  const analyzedProps = extractAnalyzedProps(propsObject)
 
   const analyzedCharacterNames = analyzedCharacters
     .map((item) => asString(item.name).trim())
     .filter(Boolean)
   const analyzedLocationNames = analyzedLocations
+    .map((item) => asString(item.name).trim())
+    .filter(Boolean)
+  const analyzedPropNames = analyzedProps
     .map((item) => asString(item.name).trim())
     .filter(Boolean)
 
@@ -387,6 +368,14 @@ export async function runStoryToScriptOrchestrator(
   const locationsLibName = analyzedLocationNames.length > 0
     ? analyzedLocationNames.join('、')
     : baseLocationsText
+  const analyzedPropNameSet = new Set(analyzedPropNames)
+  const mergedPropNames = [
+    ...analyzedPropNames,
+    ...baseProps.filter((name) => !analyzedPropNameSet.has(name)),
+  ]
+  const propsLibName = mergedPropNames.length > 0
+    ? mergedPropNames.join('、')
+    : basePropsText
 
   // 合并角色介绍：新角色 + 未被新角色覆盖的已有角色介绍
   const mergedCharacterIntroductions = [
@@ -419,6 +408,7 @@ export async function runStoryToScriptOrchestrator(
     input: content,
     locations_lib_name: locationsLibName || '无',
     characters_lib_name: charactersLibName || '无',
+    props_lib_name: propsLibName || '无',
     characters_introduction: charactersIntroduction || '暂无角色介绍',
   })
   const splitPrompt = `${splitPromptBase}${CLIP_BOUNDARY_SUFFIX}`
@@ -429,10 +419,13 @@ export async function runStoryToScriptOrchestrator(
 
   for (let attempt = 1; attempt <= MAX_SPLIT_BOUNDARY_ATTEMPTS; attempt += 1) {
     const splitMeta: StoryToScriptStepMeta = {
-      stepId: attempt === 1 ? 'split_clips' : `split_clips_retry_${attempt}`,
+      stepId: 'split_clips',
+      stepAttempt: attempt,
       stepTitle: 'progress.streamStep.splitClips',
       stepIndex: 1,
       stepTotal: 1,
+      dependsOn: ['analyze_characters', 'analyze_locations'],
+      retryable: true,
     }
 
     const { output, parsed: rawClipList } = await runStepWithRetry(
@@ -475,6 +468,7 @@ export async function runStoryToScriptOrchestrator(
         summary: asString(item.summary),
         location: asString(item.location) || null,
         characters: toStringArray(item.characters),
+        props: toStringArray(item.props),
         content: content.slice(match.startIndex, match.endIndex),
         matchLevel: match.level,
         matchConfidence: match.confidence,
@@ -515,13 +509,19 @@ export async function runStoryToScriptOrchestrator(
 
   onLog?.('开始步骤3：对每个片段做剧本转换（并行）', { clipCount: clipList.length })
 
-  const screenplayResults = await Promise.all(
-    clipList.map(async (clip, index): Promise<StoryToScriptScreenplayResult> => {
+  const screenplayResults = await mapWithConcurrency(
+    clipList,
+    concurrency,
+    async (clip, index): Promise<StoryToScriptScreenplayResult> => {
       const stepMeta: StoryToScriptStepMeta = {
         stepId: `screenplay_${clip.id}`,
         stepTitle: 'progress.streamStep.screenplayConversion',
         stepIndex: index + 1,
         stepTotal: clipList.length || 1,
+        dependsOn: ['split_clips'],
+        groupId: 'screenplay_conversion',
+        parallelKey: clip.id,
+        retryable: true,
       }
 
       try {
@@ -529,6 +529,7 @@ export async function runStoryToScriptOrchestrator(
           clip_content: clip.content,
           locations_lib_name: locationsLibName || '无',
           characters_lib_name: charactersLibName || '无',
+          props_lib_name: propsLibName || '无',
           characters_introduction: charactersIntroduction || '暂无角色介绍',
           clip_id: clip.id,
         })
@@ -558,7 +559,7 @@ export async function runStoryToScriptOrchestrator(
           error: message,
         }
       }
-    }),
+    },
   )
 
   const screenplaySuccessCount = screenplayResults.filter((item) => item.success).length
@@ -568,19 +569,24 @@ export async function runStoryToScriptOrchestrator(
   return {
     characterStep,
     locationStep,
+    propStep,
     splitStep,
     charactersObject,
     locationsObject,
+    propsObject,
     analyzedCharacters,
     analyzedLocations,
+    analyzedProps,
     charactersLibName,
     locationsLibName,
+    propsLibName,
     charactersIntroduction,
     clipList,
     screenplayResults,
     summary: {
       characterCount: analyzedCharacters.length,
       locationCount: analyzedLocations.length,
+      propCount: analyzedProps.length,
       clipCount: clipList.length,
       screenplaySuccessCount,
       screenplayFailedCount,

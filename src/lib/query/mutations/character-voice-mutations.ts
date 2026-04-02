@@ -37,14 +37,21 @@ export function useUpdateProjectCharacterVoiceSettings(projectId: string) {
             customVoiceUrl,
         }: {
             characterId: string
-            voiceType: 'custom' | null
+            voiceType: 'qwen-designed' | 'uploaded' | 'custom' | null
             voiceId?: string
             customVoiceUrl?: string
         }) => {
-            return await requestJsonWithError(`/api/novel-promotion/${projectId}/character`, {
+            return await requestJsonWithError(`/api/assets/${characterId}`, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ characterId, voiceType, voiceId, customVoiceUrl }),
+                body: JSON.stringify({
+                    scope: 'project',
+                    kind: 'character',
+                    projectId,
+                    voiceType,
+                    voiceId,
+                    customVoiceUrl,
+                }),
             }, '更新音色失败')
         },
         onSettled: invalidateProjectAssets,

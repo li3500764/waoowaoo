@@ -1,11 +1,14 @@
+import { safeParseJsonArray } from '@/lib/json-repair'
 import { buildCharactersIntroduction } from '@/lib/constants'
 import { normalizeAnyError } from '@/lib/errors/normalize'
 import { createScopedLogger } from '@/lib/logging/core'
+import { mapWithConcurrency } from '@/lib/async/map-with-concurrency'
 import {
   type ActingDirection,
   type CharacterAsset,
   type ClipCharacterRef,
   type LocationAsset,
+  type PropAsset,
   type PhotographyRule,
   type StoryboardPanel,
   formatClipId,
@@ -13,6 +16,14 @@ import {
   getFilteredFullDescription,
   getFilteredLocationsDescription,
 } from '@/lib/storyboard-phases'
+import {
+  buildPromptAssetContext,
+  compileAssetPromptFragments,
+} from '@/lib/assets/services/asset-prompt-context'
+import {
+  DEFAULT_ANALYSIS_WORKFLOW_CONCURRENCY,
+  normalizeWorkflowConcurrencyValue,
+} from '@/lib/workflow-concurrency'
 
 type JsonRecord = Record<string, unknown>
 const orchestratorLogger = createScopedLogger({ module: 'worker.orchestrator.script_to_storyboard' })
@@ -23,6 +34,11 @@ export type ScriptToStoryboardStepMeta = {
   stepTitle: string
   stepIndex: number
   stepTotal: number
+  dependsOn?: string[]
+  groupId?: string
+  parallelKey?: string
+  retryable?: boolean
+  blockedBy?: string[]
 }
 
 export type ScriptToStoryboardStepOutput = {
@@ -35,6 +51,7 @@ type ClipInput = {
   content: string | null
   characters: string | null
   location: string | null
+  props?: string | null
   screenplay: string | null
 }
 
@@ -52,10 +69,12 @@ export type ClipStoryboardPanels = {
 }
 
 export type ScriptToStoryboardOrchestratorInput = {
+  concurrency?: number
   clips: ClipInput[]
   novelPromotionData: {
     characters: CharacterAsset[]
     locations: LocationAsset[]
+    props?: PropAsset[]
   }
   promptTemplates: ScriptToStoryboardPromptTemplates
   runStep: (
@@ -68,6 +87,10 @@ export type ScriptToStoryboardOrchestratorInput = {
 
 export type ScriptToStoryboardOrchestratorResult = {
   clipPanels: ClipStoryboardPanels[]
+  phase1PanelsByClipId: Record<string, StoryboardPanel[]>
+  phase2CinematographyByClipId: Record<string, PhotographyRule[]>
+  phase2ActingByClipId: Record<string, ActingDirection[]>
+  phase3PanelsByClipId: Record<string, StoryboardPanel[]>
   summary: {
     clipCount: number
     totalPanelCount: number
@@ -86,32 +109,11 @@ export class JsonParseError extends Error {
 }
 
 function parseJsonArray<T extends JsonRecord>(responseText: string, label: string): T[] {
-  let jsonText = responseText.trim()
-  jsonText = jsonText.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '')
-
-  const firstBracket = jsonText.indexOf('[')
-  const lastBracket = jsonText.lastIndexOf(']')
-  if (firstBracket === -1 || lastBracket === -1 || lastBracket <= firstBracket) {
-    throw new JsonParseError(`${label}: JSON format invalid`, responseText)
-  }
-
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(jsonText.slice(firstBracket, lastBracket + 1))
-  } catch (e) {
-    throw new JsonParseError(
-      `${label}: JSON parse error: ${e instanceof Error ? e.message : String(e)}`,
-      responseText,
-    )
-  }
-  if (!Array.isArray(parsed) || parsed.length === 0) {
+  const rows = safeParseJsonArray(responseText)
+  if (rows.length === 0) {
     throw new JsonParseError(`${label}: empty result`, responseText)
   }
-  const rows = parsed.filter((item): item is T => typeof item === 'object' && item !== null)
-  if (rows.length === 0) {
-    throw new JsonParseError(`${label}: invalid payload`, responseText)
-  }
-  return rows
+  return rows as T[]
 }
 
 
@@ -125,6 +127,19 @@ function parseClipCharacters(raw: string | null): ClipCharacterRef[] {
     return parsed as ClipCharacterRef[]
   } catch (error) {
     throw new Error(`Invalid clip characters JSON: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+function parseClipProps(raw: string | null): string[] {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) {
+      throw new Error('props field must be JSON array')
+    }
+    return parsed.map((item) => (typeof item === 'string' ? item.trim() : '')).filter(Boolean)
+  } catch (error) {
+    throw new Error(`Invalid clip props JSON: ${error instanceof Error ? error.message : String(error)}`)
   }
 }
 
@@ -142,12 +157,14 @@ function withStepMeta(
   stepTitle: string,
   stepIndex: number,
   stepTotal: number,
+  extra?: Pick<ScriptToStoryboardStepMeta, 'dependsOn' | 'groupId' | 'parallelKey' | 'retryable' | 'blockedBy'>,
 ): ScriptToStoryboardStepMeta {
   return {
     stepId,
     stepTitle,
     stepIndex,
     stepTotal,
+    ...extra,
   }
 }
 
@@ -198,7 +215,14 @@ function shouldRetryStepError(error: unknown, message: string, retryable: boolea
   if (error instanceof JsonParseError) return true
   if (retryable) return true
   const lowerMessage = message.toLowerCase()
-  return lowerMessage.includes('json') || lowerMessage.includes('parse')
+  if (lowerMessage.includes('ark responses 调用失败')) return false
+  if (lowerMessage.includes('invalidparameter')) return false
+  if (lowerMessage.includes('unknown field')) return false
+  return lowerMessage.includes('unexpected token')
+    || lowerMessage.includes('unexpected end of json input')
+    || lowerMessage.includes('json format invalid')
+    || lowerMessage.includes('invalid json output')
+    || lowerMessage.includes('parse')
 }
 
 async function runStepWithRetry<T>(
@@ -260,10 +284,14 @@ async function runStepWithRetry<T>(
 export async function runScriptToStoryboardOrchestrator(
   input: ScriptToStoryboardOrchestratorInput,
 ): Promise<ScriptToStoryboardOrchestratorResult> {
-  const { clips, novelPromotionData, promptTemplates, runStep } = input
+  const { clips, novelPromotionData, promptTemplates, runStep, concurrency: rawConcurrency } = input
   if (!Array.isArray(clips) || clips.length === 0) {
     throw new Error('No clips found')
   }
+  const concurrency = normalizeWorkflowConcurrencyValue(
+    rawConcurrency,
+    DEFAULT_ANALYSIS_WORKFLOW_CONCURRENCY,
+  )
 
   const totalStepCount = clips.length * 4 + 2
   const charactersLibName = (novelPromotionData.characters || []).map((c) => c.name).join(', ') || '无'
@@ -271,23 +299,38 @@ export async function runScriptToStoryboardOrchestrator(
   const charactersIntroduction = buildCharactersIntroduction(novelPromotionData.characters || [])
 
   const phase1PanelsByClipId = new Map<string, StoryboardPanel[]>()
+  const phase2CinematographyByClipId = new Map<string, PhotographyRule[]>()
+  const phase2ActingByClipId = new Map<string, ActingDirection[]>()
+  const phase3PanelsByClipId = new Map<string, StoryboardPanel[]>()
 
-  const phase1Results = await Promise.all(
-    clips.map(async (clip, i) => {
+  const phase1Results = await mapWithConcurrency(
+    clips,
+    concurrency,
+    async (clip, i) => {
       const clipIndex = i + 1
       const clipContent = typeof clip.content === 'string' ? clip.content.trim() : ''
       if (!clipContent) {
         throw new Error(`Clip ${formatClipId(clip)} content is empty`)
       }
       const clipCharacters = parseClipCharacters(clip.characters)
+      const clipProps = parseClipProps(clip.props ?? null)
       const filteredAppearanceList = getFilteredAppearanceList(novelPromotionData.characters || [], clipCharacters)
       const filteredFullDescription = getFilteredFullDescription(novelPromotionData.characters || [], clipCharacters)
+      const filteredPropDescription = compileAssetPromptFragments(buildPromptAssetContext({
+        characters: [],
+        locations: [],
+        props: novelPromotionData.props || [],
+        clipCharacters: [],
+        clipLocation: null,
+        clipProps,
+      })).propsDescriptionText
       const clipJson = JSON.stringify(
         {
           id: clip.id,
           content: clipContent,
           characters: clipCharacters,
           location: clip.location || null,
+          props: clipProps,
         },
         null,
         2,
@@ -299,6 +342,7 @@ export async function runScriptToStoryboardOrchestrator(
         .replace('{characters_introduction}', charactersIntroduction)
         .replace('{characters_appearance_list}', filteredAppearanceList)
         .replace('{characters_full_description}', filteredFullDescription)
+        .replace('{props_description}', filteredPropDescription)
         .replace('{clip_json}', clipJson)
 
       const screenplay = parseScreenplay(clip.screenplay)
@@ -313,6 +357,11 @@ export async function runScriptToStoryboardOrchestrator(
         'progress.streamStep.storyboardPlan',
         clipIndex,
         totalStepCount,
+        {
+          groupId: `clip_${clip.id}`,
+          parallelKey: 'phase1',
+          retryable: true,
+        },
       )
       const { parsed: planPanels } = await runStepWithRetry(
         runStep, phase1Meta, phase1Prompt, 'storyboard_phase1_plan', 2600,
@@ -329,18 +378,21 @@ export async function runScriptToStoryboardOrchestrator(
         clipId: clip.id,
         planPanels,
       }
-    }),
+    },
   )
 
   for (const result of phase1Results) {
     phase1PanelsByClipId.set(result.clipId, result.planPanels)
   }
 
-  const clipPanels = await Promise.all(
-    clips.map(async (clip, index): Promise<ClipStoryboardPanels> => {
+  const clipPanels = await mapWithConcurrency(
+    clips,
+    concurrency,
+    async (clip, index): Promise<ClipStoryboardPanels> => {
       const clipIndex = index + 1
       const clipCharacters = parseClipCharacters(clip.characters)
       const clipLocation = clip.location || null
+      const clipProps = parseClipProps(clip.props ?? null)
       const planPanels = phase1PanelsByClipId.get(clip.id) || []
       if (planPanels.length === 0) {
         throw new Error(`Missing phase1 result for clip ${formatClipId(clip)}`)
@@ -351,24 +403,53 @@ export async function runScriptToStoryboardOrchestrator(
         novelPromotionData.locations || [],
         clipLocation,
       )
+      const filteredPropsDescription = compileAssetPromptFragments(buildPromptAssetContext({
+        characters: [],
+        locations: [],
+        props: novelPromotionData.props || [],
+        clipCharacters: [],
+        clipLocation: null,
+        clipProps,
+      })).propsDescriptionText
 
       const phase2Meta = withStepMeta(
         `clip_${clip.id}_phase2_cinematography`,
         'progress.streamStep.cinematographyRules',
         clips.length + index * 3 + 1,
         totalStepCount,
+        {
+          dependsOn: [`clip_${clip.id}_phase1`],
+          groupId: `clip_${clip.id}`,
+          parallelKey: 'phase2',
+          retryable: true,
+        },
       )
       const phase2ActingMeta = withStepMeta(
         `clip_${clip.id}_phase2_acting`,
         'progress.streamStep.actingDirection',
         clips.length + index * 3 + 2,
         totalStepCount,
+        {
+          dependsOn: [`clip_${clip.id}_phase1`],
+          groupId: `clip_${clip.id}`,
+          parallelKey: 'phase2',
+          retryable: true,
+        },
       )
       const phase3Meta = withStepMeta(
         `clip_${clip.id}_phase3_detail`,
         'progress.streamStep.storyboardDetailRefine',
         clips.length + index * 3 + 3,
         totalStepCount,
+        {
+          dependsOn: [
+            `clip_${clip.id}_phase2_cinematography`,
+            `clip_${clip.id}_phase2_acting`,
+          ],
+          groupId: `clip_${clip.id}`,
+          parallelKey: 'phase3',
+          retryable: true,
+        },
       )
 
       const phase2Prompt = promptTemplates.phase2CinematographyTemplate
@@ -376,6 +457,7 @@ export async function runScriptToStoryboardOrchestrator(
         .replace(/\{panel_count\}/g, String(planPanels.length))
         .replace('{locations_description}', filteredLocationsDescription)
         .replace('{characters_info}', filteredFullDescription)
+        .replace('{props_description}', filteredPropsDescription)
 
       const phase2ActingPrompt = promptTemplates.phase2ActingTemplate
         .replace('{panels_json}', JSON.stringify(planPanels, null, 2))
@@ -386,11 +468,11 @@ export async function runScriptToStoryboardOrchestrator(
         .replace('{panels_json}', JSON.stringify(planPanels, null, 2))
         .replace('{characters_age_gender}', filteredFullDescription)
         .replace('{locations_description}', filteredLocationsDescription)
+        .replace('{props_description}', filteredPropsDescription)
 
       const [
         { parsed: photographyRules },
         { parsed: actingDirections },
-        { parsed: filteredPhase3Panels },
       ] = await Promise.all([
         runStepWithRetry(
           runStep, phase2Meta, phase2Prompt, 'storyboard_phase2_cinematography', 2400,
@@ -400,20 +482,24 @@ export async function runScriptToStoryboardOrchestrator(
           runStep, phase2ActingMeta, phase2ActingPrompt, 'storyboard_phase2_acting', 2400,
           (text) => parseJsonArray<ActingDirection>(text, `phase2-acting:${formatClipId(clip)}`),
         ),
-        runStepWithRetry(
-          runStep, phase3Meta, phase3Prompt, 'storyboard_phase3_detail', 2600,
-          (text) => {
-            const panels = parseJsonArray<StoryboardPanel>(text, `phase3:${formatClipId(clip)}`)
-            const filtered = panels.filter(
-              (panel) => panel.description && panel.description !== '无' && panel.location !== '无',
-            )
-            if (filtered.length === 0) {
-              throw new Error(`Phase 3 returned empty valid panels for clip ${formatClipId(clip)}`)
-            }
-            return filtered
-          },
-        ),
       ])
+      const { parsed: filteredPhase3Panels } = await runStepWithRetry(
+        runStep, phase3Meta, phase3Prompt, 'storyboard_phase3_detail', 2600,
+        (text) => {
+          const panels = parseJsonArray<StoryboardPanel>(text, `phase3:${formatClipId(clip)}`)
+          const filtered = panels.filter(
+            (panel) => panel.description && panel.description !== '无' && panel.location !== '无',
+          )
+          if (filtered.length === 0) {
+            throw new Error(`Phase 3 returned empty valid panels for clip ${formatClipId(clip)}`)
+          }
+          return filtered
+        },
+      )
+
+      phase2CinematographyByClipId.set(clip.id, photographyRules)
+      phase2ActingByClipId.set(clip.id, actingDirections)
+      phase3PanelsByClipId.set(clip.id, filteredPhase3Panels)
 
       return {
         clipId: clip.id,
@@ -424,12 +510,25 @@ export async function runScriptToStoryboardOrchestrator(
           actingDirections,
         }),
       }
-    }),
+    },
   )
 
   const totalPanelCount = clipPanels.reduce((sum, item) => sum + item.finalPanels.length, 0)
+
+  const mapToRecord = <T>(source: Map<string, T>): Record<string, T> => {
+    const output: Record<string, T> = {}
+    for (const [key, value] of source.entries()) {
+      output[key] = value
+    }
+    return output
+  }
+
   return {
     clipPanels,
+    phase1PanelsByClipId: mapToRecord(phase1PanelsByClipId),
+    phase2CinematographyByClipId: mapToRecord(phase2CinematographyByClipId),
+    phase2ActingByClipId: mapToRecord(phase2ActingByClipId),
+    phase3PanelsByClipId: mapToRecord(phase3PanelsByClipId),
     summary: {
       clipCount: clips.length,
       totalPanelCount,

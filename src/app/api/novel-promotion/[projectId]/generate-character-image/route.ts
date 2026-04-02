@@ -1,106 +1,89 @@
-import { logError as _ulogError } from '@/lib/logging/core'
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { requireProjectAuthLight, isErrorResponse } from '@/lib/api-auth'
 import { apiHandler, ApiError } from '@/lib/api-errors'
 import { resolveTaskLocale } from '@/lib/task/resolve-locale'
+import { isArtStyleValue, type ArtStyleValue } from '@/lib/constants'
+import { normalizeImageGenerationCount } from '@/lib/image-generation/count'
+import { submitAssetGenerateTask } from '@/lib/assets/services/asset-actions'
 
 function toObject(value: unknown): Record<string, unknown> {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
-    return value as Record<string, unknown>
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return value as Record<string, unknown>
 }
 
-/**
- * POST /api/novel-promotion/[projectId]/generate-character-image
- * 专门用于后台触发角色图片生成的简化 API
- * 内部调用 generate-image API
- */
+function normalizeString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
 export const POST = apiHandler(async (
-    request: NextRequest,
-    context: { params: Promise<{ projectId: string }> }
+  request: NextRequest,
+  context: { params: Promise<{ projectId: string }> },
 ) => {
-    const { projectId } = await context.params
+  const { projectId } = await context.params
+  const authResult = await requireProjectAuthLight(projectId)
+  if (isErrorResponse(authResult)) return authResult
 
-    // 🔐 统一权限验证
-    const authResult = await requireProjectAuthLight(projectId)
-    if (isErrorResponse(authResult)) return authResult
+  const rawBody = await request.json().catch(() => ({}))
+  const body = toObject(rawBody)
+  const taskLocale = resolveTaskLocale(request, body)
+  const bodyMeta = toObject(body.meta)
+  const characterId = normalizeString(body.characterId)
+  const appearanceId = normalizeString(body.appearanceId)
+  const count = normalizeImageGenerationCount('character', body.count)
 
-    const body = await request.json()
-    const taskLocale = resolveTaskLocale(request, body)
-    const bodyMeta = toObject((body as Record<string, unknown>).meta)
-    const acceptLanguage = request.headers.get('accept-language') || ''
-    const { characterId, appearanceId, artStyle } = body
-
-    if (!characterId) {
-        throw new ApiError('INVALID_PARAMS')
+  let artStyle: ArtStyleValue | undefined
+  if (Object.prototype.hasOwnProperty.call(body, 'artStyle')) {
+    const parsedArtStyle = normalizeString(body.artStyle)
+    if (!isArtStyleValue(parsedArtStyle)) {
+      throw new ApiError('INVALID_PARAMS', {
+        code: 'INVALID_ART_STYLE',
+        message: 'artStyle must be a supported value',
+      })
     }
+    artStyle = parsedArtStyle
+  }
 
-    // 如果没有传 appearanceId，获取第一个 appearance 的 id
-    let targetAppearanceId = appearanceId
-    if (!targetAppearanceId) {
-        const character = await prisma.novelPromotionCharacter.findUnique({
-            where: { id: characterId },
-            include: { appearances: { orderBy: { appearanceIndex: 'asc' } } }
-        })
-        if (!character) {
-            throw new ApiError('NOT_FOUND')
-        }
-        const firstAppearance = character.appearances?.[0]
-        if (!firstAppearance) {
-            throw new ApiError('NOT_FOUND')
-        }
-        targetAppearanceId = firstAppearance.id
-    }
+  if (!characterId) {
+    throw new ApiError('INVALID_PARAMS')
+  }
 
-    // 如果设置了 artStyle，需要更新到 novelPromotionProject 中（供 generate-image 使用）
-    if (artStyle) {
-        const novelData = await prisma.novelPromotionProject.findUnique({ where: { projectId } })
-        if (novelData) {
-            // 将风格转换为提示词
-            const ART_STYLES = [
-                { value: 'american-comic', prompt: '美式漫画风格' },
-                { value: 'chinese-comic', prompt: '精致国漫风格' },
-                { value: 'anime', prompt: '日系动漫风格' },
-                { value: 'realistic', prompt: '真人照片写实风格' }
-            ]
-            const style = ART_STYLES.find(s => s.value === artStyle)
-            if (style) {
-                await prisma.novelPromotionProject.update({
-                    where: { id: novelData.id },
-                    data: { artStylePrompt: style.prompt }
-                })
-            }
-        }
-    }
-
-    // 调用 generate-image API
-    const { getBaseUrl } = await import('@/lib/env')
-    const baseUrl = getBaseUrl()
-    const generateRes = await fetch(`${baseUrl}/api/novel-promotion/${projectId}/generate-image`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Cookie': request.headers.get('cookie') || '',
-            ...(acceptLanguage ? { 'Accept-Language': acceptLanguage } : {})
-        },
-        body: JSON.stringify({
-            type: 'character',
-            id: characterId,
-            appearanceId: targetAppearanceId,  // 使用真正的 UUID
-            locale: taskLocale || undefined,
-            meta: {
-                ...bodyMeta,
-                locale: taskLocale || bodyMeta.locale || undefined,
-            },
-        })
+  let targetAppearanceId = appearanceId
+  if (!targetAppearanceId) {
+    const character = await prisma.novelPromotionCharacter.findUnique({
+      where: { id: characterId },
+      include: { appearances: { orderBy: { appearanceIndex: 'asc' } } },
     })
-
-    const result = await generateRes.json()
-
-    if (!generateRes.ok) {
-        _ulogError('[Generate Character Image] 失败:', result.error)
-        throw new ApiError('GENERATION_FAILED')
+    if (!character) {
+      throw new ApiError('NOT_FOUND')
     }
+    const firstAppearance = character.appearances[0]
+    if (!firstAppearance) {
+      throw new ApiError('NOT_FOUND')
+    }
+    targetAppearanceId = firstAppearance.id
+  }
 
-    return NextResponse.json(result)
+  const result = await submitAssetGenerateTask({
+    request,
+    kind: 'character',
+    assetId: characterId,
+    body: {
+      appearanceId: targetAppearanceId,
+      count,
+      artStyle,
+      locale: taskLocale || undefined,
+      meta: {
+        ...bodyMeta,
+        locale: taskLocale || bodyMeta.locale || undefined,
+      },
+    },
+    access: {
+      scope: 'project',
+      userId: authResult.session.user.id,
+      projectId,
+    },
+  })
+
+  return NextResponse.json(result)
 })

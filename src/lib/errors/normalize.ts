@@ -38,6 +38,85 @@ function containsAny(haystack: string, needles: string[]) {
   return false
 }
 
+function isModelNotOpenCode(code: unknown): boolean {
+  if (typeof code !== 'string') return false
+  const normalized = code.trim().toUpperCase()
+  return normalized === 'MODELNOTOPEN' || normalized === 'MODEL_NOT_OPEN'
+}
+
+function isModelNotOpenMessage(message: string): boolean {
+  return containsAny(message, [
+    'modelnotopen',
+    'has not activated the model',
+    'not activated the model',
+    'activate the model service in the ark console',
+  ])
+}
+
+function isModelNotRegisteredMessage(message: string): boolean {
+  return containsAny(message, [
+    'model_not_registered',
+    'model not registered',
+  ])
+}
+
+/**
+ * MODEL_NOT_CONFIGURED: 用户未配置对应类型的模型
+ * 覆盖形式：model_not_found / model_not_configured / no xxx model is enabled
+ */
+function isModelNotConfiguredMessage(message: string): boolean {
+  return containsAny(message, [
+    'model_not_found',
+    'model_not_configured',
+    'is not enabled for image',
+    'is not enabled for video',
+    'is not enabled for audio',
+    'is not enabled for lipsync',
+    'is not enabled for llm',
+    'no image model is enabled',
+    'no video model is enabled',
+    'no audio model is enabled',
+    'no lipsync model is enabled',
+    'no llm model is enabled',
+    'multiple image models are enabled',
+    'multiple video models are enabled',
+    'multiple audio models are enabled',
+    'multiple lipsync models are enabled',
+    'multiple llm models are enabled',
+  ])
+}
+
+function isEmptyResponseMessage(message: string): boolean {
+  return containsAny(message, [
+    'channel:empty_response',
+    'empty response',
+    'no meaningful content in candidates',
+    'stream_empty',
+  ])
+}
+
+function isVideoApiFormatUnsupportedMessage(message: string): boolean {
+  if (containsAny(message, [
+    'video_api_format_unsupported',
+    'openai_compat_video_template_required',
+    'openai_compat_video_template_media_type_invalid',
+    'openai_compat_video_template_create_body_required',
+    'openai_compat_video_template_output_not_found',
+    'openai_compat_video_template_task_id_not_found',
+    'openai_compat_template_variable_missing',
+    'openai_compat_template_multipart_body_invalid',
+    'openai_compat_template_multipart_file_invalid',
+  ])) {
+    return true
+  }
+
+  const templateStatusMatch = message.match(/template request failed with status (\d{3})/i)
+  if (!templateStatusMatch) return false
+
+  const parsedStatus = Number.parseInt(templateStatusMatch[1] || '', 10)
+  return parsedStatus === 404 || parsedStatus === 405 || parsedStatus === 415
+}
+
 function buildNormalizedError(
   code: UnifiedErrorCode,
   message?: string,
@@ -64,14 +143,41 @@ function inferCodeFromMessage(message: string): UnifiedErrorCode | null {
     return explicitMatch[1]
   }
 
+  const statusMatch = message.match(/\bstatus\s+(\d{3})\b/)
+  if (statusMatch) {
+    const parsedStatus = Number.parseInt(statusMatch[1] || '', 10)
+    if (Number.isFinite(parsedStatus)) {
+      if (parsedStatus === 404 || parsedStatus === 405 || parsedStatus === 415) {
+        return 'VIDEO_API_FORMAT_UNSUPPORTED'
+      }
+      if (parsedStatus === 401) return 'UNAUTHORIZED'
+      if (parsedStatus === 403) return 'FORBIDDEN'
+      if (parsedStatus === 404) return 'NOT_FOUND'
+      if (parsedStatus === 409) return 'CONFLICT'
+      if (parsedStatus === 422) return 'SENSITIVE_CONTENT'
+      if (parsedStatus === 429) return 'RATE_LIMIT'
+      if (parsedStatus === 502 || parsedStatus === 503) return 'EXTERNAL_ERROR'
+      if (parsedStatus === 504) return 'GENERATION_TIMEOUT'
+      if (parsedStatus >= 500) return 'EXTERNAL_ERROR'
+      if (parsedStatus >= 400) return 'INVALID_PARAMS'
+    }
+  }
+
+  if (isModelNotOpenMessage(message)) return 'MODEL_NOT_OPEN'
+  if (isModelNotRegisteredMessage(message)) return 'MODEL_NOT_REGISTERED'
+  if (isModelNotConfiguredMessage(message)) return 'MODEL_NOT_CONFIGURED'
+  if (isEmptyResponseMessage(message)) return 'EMPTY_RESPONSE'
+  if (isVideoApiFormatUnsupportedMessage(message)) return 'VIDEO_API_FORMAT_UNSUPPORTED'
   if (containsAny(message, ['task cancelled', 'canceled by user', 'cancelled by user', '任务已取消'])) return 'CONFLICT'
   if (containsAny(message, ['unauthorized', 'not authenticated', 'need login', '401'])) return 'UNAUTHORIZED'
+  // AccountOverdueError（ARK 欠费 403）必须在 FORBIDDEN 之前检查
+  if (containsAny(message, ['accountoverdueerror', 'overdue balance', 'overdue', 'account has an overdue'])) return 'INSUFFICIENT_BALANCE'
   if (containsAny(message, ['forbidden', 'permission denied', '403'])) return 'FORBIDDEN'
   if (containsAny(message, ['not found', '不存在', 'missing record'])) return 'NOT_FOUND'
   if (containsAny(message, ['invalid', 'missing', 'required', 'bad request', 'fieldinvalid'])) return 'INVALID_PARAMS'
   if (containsAny(message, ['quota', 'rate limit', 'resource_exhausted', 'throttle', '429'])) return 'RATE_LIMIT'
   if (containsAny(message, ['insufficient balance', 'creditinsufficient', 'balance is not enough', '402', 'insufficient credits', '余额不足', '余额不够', '请充值'])) return 'INSUFFICIENT_BALANCE'
-  if (containsAny(message, ['sensitive', 'unsafe', 'safety', 'blocked', 'prohibited', 'policy_violation', 'moderation', 'harm', '敏感', '违规', '不当']) && !containsAny(message, ['case-sensitive', 'case sensitive'])) return 'SENSITIVE_CONTENT'
+  if (containsAny(message, ['sensitive', 'unsafe', 'safety', 'blocked', 'prohibited', 'policy_violation', 'moderation', 'harm', '敏感', '违规', '不当', '安全策略', '被过滤']) && !containsAny(message, ['case-sensitive', 'case sensitive'])) return 'SENSITIVE_CONTENT'
   if (containsAny(message, ['timeout', 'timed out', 'deadline exceeded'])) return 'GENERATION_TIMEOUT'
   if (containsAny(message, ['503', 'unavailable', 'overloaded', 'upstream error'])) return 'EXTERNAL_ERROR'
   if (containsAny(message, ['network', 'fetch failed', 'econnreset', 'enotfound', 'econnrefused', 'eai_again', 'terminated', 'aborted', 'socket hang up'])) return 'NETWORK_ERROR'
@@ -142,9 +248,28 @@ export function normalizeAnyError(input: unknown, options: NormalizeOptions = {}
     }, provider)
   }
 
+  if (isModelNotOpenCode(errorLike.code) || isModelNotOpenMessage(lowerMessage)) {
+    return buildNormalizedError('MODEL_NOT_OPEN', message, options.details, provider)
+  }
+  if (isModelNotRegisteredMessage(lowerMessage)) {
+    return buildNormalizedError('MODEL_NOT_REGISTERED', message, options.details, provider)
+  }
+  if (isModelNotConfiguredMessage(lowerMessage)) {
+    return buildNormalizedError('MODEL_NOT_CONFIGURED', message, options.details, provider)
+  }
+  if (isEmptyResponseMessage(lowerMessage)) {
+    return buildNormalizedError('EMPTY_RESPONSE', message, options.details, provider)
+  }
+
   if (typeof errorLike.status === 'number') {
     if (errorLike.status === 401) return buildNormalizedError('UNAUTHORIZED', message, options.details, provider)
-    if (errorLike.status === 403) return buildNormalizedError('FORBIDDEN', message, options.details, provider)
+    // 403 可能是欠费（AccountOverdueError），需优先检查消息内容再决定错误码
+    if (errorLike.status === 403) {
+      if (containsAny(lowerMessage, ['accountoverdueerror', 'overdue balance', 'overdue', 'account has an overdue'])) {
+        return buildNormalizedError('INSUFFICIENT_BALANCE', message, options.details, provider)
+      }
+      return buildNormalizedError('FORBIDDEN', message, options.details, provider)
+    }
     if (errorLike.status === 404) return buildNormalizedError('NOT_FOUND', message, options.details, provider)
     if (errorLike.status === 409) return buildNormalizedError('CONFLICT', message, options.details, provider)
     if (errorLike.status === 422) return buildNormalizedError('SENSITIVE_CONTENT', message, options.details, provider)

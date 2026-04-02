@@ -9,37 +9,44 @@ import { useTranslations } from 'next-intl'
  * 🔥 V6.5 重构：内部直接订阅 useProjectAssets，消除 props drilling
  */
 
-import { Location } from '@/types/project'
+import { Location, Prop } from '@/types/project'
 import { useProjectAssets } from '@/lib/query/hooks/useProjectAssets'
 import LocationCard from './LocationCard'
 import { AppIcon } from '@/components/ui/icons'
+import { resolveLocationBackedGenerateType } from './location-backed-asset'
 
 interface LocationSectionProps {
     // 🔥 V6.5 删除：locations prop - 现在内部直接订阅
     projectId: string
+    assetType?: 'location' | 'prop'
     activeTaskKeys: Set<string>
     onClearTaskKey: (key: string) => void
+    onRegisterTransientTaskKey: (key: string) => void
     // 回调函数
     onAddLocation: () => void
     onDeleteLocation: (locationId: string) => void
-    onEditLocation: (location: Location) => void
+    onEditLocation: (location: Location | Prop) => void
     // 🔥 V6.6 重构：重命名为 handleGenerateImage
-    handleGenerateImage: (type: 'character' | 'location', id: string, appearanceId?: string) => void
+    handleGenerateImage: (type: 'character' | 'location' | 'prop', id: string, appearanceId?: string, count?: number) => Promise<void>
     onSelectImage: (locationId: string, imageIndex: number | null) => void
     onConfirmSelection: (locationId: string) => void
-    onRegenerateSingle: (locationId: string, imageIndex: number) => void
-    onRegenerateGroup: (locationId: string) => void
+    onRegenerateSingle: (locationId: string, imageIndex: number) => Promise<void>
+    onRegenerateGroup: (locationId: string, count?: number) => Promise<void>
     onUndo: (locationId: string) => void
     onImageClick: (imageUrl: string) => void
     onImageEdit: (locationId: string, imageIndex: number, locationName: string) => void
     onCopyFromGlobal: (locationId: string) => void  // 🆕 从资产中心复制
+    /** 分集筛选：仅显示指定 ID 的场景/道具，null 表示显示全部 */
+    filterIds?: Set<string> | null
 }
 
 export default function LocationSection({
     // 🔥 V6.5 删除：locations prop - 现在内部直接订阅
     projectId,
+    assetType = 'location',
     activeTaskKeys,
     onClearTaskKey,
+    onRegisterTransientTaskKey,
     onAddLocation,
     onDeleteLocation,
     onEditLocation,
@@ -51,13 +58,18 @@ export default function LocationSection({
     onUndo,
     onImageClick,
     onImageEdit,
-    onCopyFromGlobal
+    onCopyFromGlobal,
+    filterIds = null,
 }: LocationSectionProps) {
     const t = useTranslations('assets')
 
-    // 🔥 V6.5 重构：直接订阅缓存，消除 props drilling
     const { data: assets } = useProjectAssets(projectId)
-    const locations: Location[] = assets?.locations ?? []
+    const allLocations: Array<Location | Prop> = assetType === 'prop'
+        ? assets?.props ?? []
+        : assets?.locations ?? []
+    const locations = filterIds ? allLocations.filter((l) => filterIds.has(l.id)) : allLocations
+    const assetKey = assetType === 'prop' ? 'prop' : 'location'
+    const generateType = resolveLocationBackedGenerateType(assetType)
 
     return (
         <div className="glass-surface p-6">
@@ -66,16 +78,20 @@ export default function LocationSection({
                     <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl bg-[var(--glass-tone-info-bg)] text-[var(--glass-tone-info-fg)]">
                         <AppIcon name="imageLandscape" className="h-5 w-5" />
                     </span>
-                    <h3 className="text-lg font-bold text-[var(--glass-text-primary)]">{t("stage.locationAssets")}</h3>
+                    <h3 className="text-lg font-bold text-[var(--glass-text-primary)]">
+                        {assetType === 'prop' ? t('stage.propAssets') : t("stage.locationAssets")}
+                    </h3>
                     <span className="text-sm text-[var(--glass-text-tertiary)] bg-[var(--glass-bg-muted)]/50 px-2 py-1 rounded-lg">
-                        {t("stage.locationCounts", { count: locations.length })}
+                        {assetType === 'prop'
+                            ? t('stage.propCounts', { count: locations.length })
+                            : t("stage.locationCounts", { count: locations.length })}
                     </span>
                 </div>
                 <button
                     onClick={onAddLocation}
                     className="glass-btn-base glass-btn-primary flex items-center gap-2 px-4 py-2 font-medium"
                 >
-                    + {t("location.add")}
+                    + {t(`${assetKey}.add`)}
                 </button>
             </div>
 
@@ -84,9 +100,10 @@ export default function LocationSection({
                     <LocationCard
                         key={location.id}
                         location={location}
+                        assetType={assetType}
                         onEdit={() => onEditLocation(location)}
                         onDelete={() => onDeleteLocation(location.id)}
-                        onRegenerate={() => {
+                        onRegenerate={(count) => {
                             // 获取有效图片数量
                             const validImages = location.images?.filter(img => img.imageUrl) || []
 
@@ -100,16 +117,30 @@ export default function LocationSection({
                             // 单图：重新生成单张
                             if (validImages.length === 1) {
                                 const imageIndex = validImages[0].imageIndex
+                                const taskKey = `location-${location.id}-${imageIndex}`
                                 _ulogInfo('[LocationSection] 调用单张重新生成, imageIndex:', imageIndex)
-                                onRegenerateSingle(location.id, imageIndex)
+                                onRegisterTransientTaskKey(taskKey)
+                                void onRegenerateSingle(location.id, imageIndex).catch(() => {
+                                    onClearTaskKey(taskKey)
+                                })
                             }
                             // 多图或无图：重新生成整组
                             else {
+                                const taskKey = `location-${location.id}-group`
                                 _ulogInfo('[LocationSection] 调用整组重新生成')
-                                onRegenerateGroup(location.id)
+                                onRegisterTransientTaskKey(taskKey)
+                                void onRegenerateGroup(location.id, count).catch(() => {
+                                    onClearTaskKey(taskKey)
+                                })
                             }
                         }}
-                        onGenerate={() => handleGenerateImage('location', location.id)}
+                        onGenerate={(count) => {
+                            const taskKey = `location-${location.id}-group`
+                            onRegisterTransientTaskKey(taskKey)
+                            void handleGenerateImage(generateType, location.id, undefined, count).catch(() => {
+                                onClearTaskKey(taskKey)
+                            })
+                        }}
                         onUndo={() => onUndo(location.id)}
                         onImageClick={onImageClick}
                         onSelectImage={onSelectImage}
@@ -118,7 +149,7 @@ export default function LocationSection({
                         activeTaskKeys={activeTaskKeys}
                         onClearTaskKey={onClearTaskKey}
                         projectId={projectId}
-                        onConfirmSelection={onConfirmSelection}
+                        onConfirmSelection={assetType === 'location' ? onConfirmSelection : undefined}
                     />
                 ))}
             </div>

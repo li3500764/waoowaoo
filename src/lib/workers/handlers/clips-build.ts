@@ -1,6 +1,7 @@
 import type { Job } from 'bullmq'
+import { safeParseJsonArray } from '@/lib/json-repair'
 import { prisma } from '@/lib/prisma'
-import { chatCompletion, getCompletionContent } from '@/lib/llm-client'
+import { executeAiTextStep } from '@/lib/ai-runtime'
 import { withInternalLLMStreamCallbacks } from '@/lib/llm-observe/internal-stream-context'
 import { buildCharactersIntroduction } from '@/lib/constants'
 import { createClipContentMatcher } from '@/lib/novel-promotion/story-to-script/clip-matching'
@@ -9,30 +10,14 @@ import { assertTaskActive } from '@/lib/workers/utils'
 import { createWorkerLLMStreamCallbacks, createWorkerLLMStreamContext } from './llm-stream'
 import type { TaskJobData } from '@/lib/task/types'
 import { buildPrompt, PROMPT_IDS } from '@/lib/prompt-i18n'
+import { resolveAnalysisModel } from './resolve-analysis-model'
+
+function readAssetKind(value: Record<string, unknown>): string {
+  return typeof value.assetKind === 'string' ? value.assetKind : 'location'
+}
 
 function parseClipArrayResponse(responseText: string): Array<Record<string, unknown>> {
-  let cleaned = responseText.trim()
-  cleaned = cleaned
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/, '')
-    .replace(/\s*```$/g, '')
-    .trim()
-
-  const firstBracket = cleaned.indexOf('[')
-  const lastBracket = cleaned.lastIndexOf(']')
-  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
-    const parsed = JSON.parse(cleaned.slice(firstBracket, lastBracket + 1))
-    if (Array.isArray(parsed)) return parsed as Array<Record<string, unknown>>
-  }
-
-  const firstBrace = cleaned.indexOf('{')
-  const lastBrace = cleaned.lastIndexOf('}')
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    const parsed = JSON.parse(cleaned.slice(firstBrace, lastBrace + 1)) as { clips?: unknown }
-    if (Array.isArray(parsed.clips)) return parsed.clips as Array<Record<string, unknown>>
-  }
-
-  throw new Error('Invalid clip JSON format')
+  return safeParseJsonArray(responseText, 'clips')
 }
 
 function readText(value: unknown): string {
@@ -50,6 +35,12 @@ const CLIP_BOUNDARY_SUFFIX = `
 export async function handleClipsBuildTask(job: Job<TaskJobData>) {
   const payload = (job.data.payload || {}) as Record<string, unknown>
   const projectId = job.data.projectId
+  const clipModel = prisma.novelPromotionClip as unknown as {
+    update: (args: { where: { id: string }; data: Record<string, unknown>; select: { id: true } }) => Promise<{ id: string }>
+    create: (args: { data: Record<string, unknown>; select: { id: true } }) => Promise<{ id: string }>
+    findMany: typeof prisma.novelPromotionClip.findMany
+    deleteMany: typeof prisma.novelPromotionClip.deleteMany
+  }
   const episodeId = readText(payload.episodeId || job.data.episodeId).trim()
   if (!episodeId) {
     throw new Error('episodeId is required')
@@ -76,9 +67,11 @@ export async function handleClipsBuildTask(job: Job<TaskJobData>) {
   if (!novelData) {
     throw new Error('Novel promotion data not found')
   }
-  if (!novelData.analysisModel) {
-    throw new Error('analysisModel is not configured')
-  }
+  const analysisModel = await resolveAnalysisModel({
+    userId: job.data.userId,
+    inputModel: payload.model,
+    projectAnalysisModel: novelData.analysisModel,
+  })
 
   const episode = await prisma.novelPromotionEpisode.findUnique({
     where: { id: episodeId },
@@ -101,11 +94,14 @@ export async function handleClipsBuildTask(job: Job<TaskJobData>) {
     throw new Error('No novel text to process')
   }
 
-  const locationsLibName = novelData.locations.length > 0
-    ? novelData.locations.map((item) => item.name).join('、')
+  const locationsLibName = novelData.locations.filter((item) => readAssetKind(item as unknown as Record<string, unknown>) !== 'prop').length > 0
+    ? novelData.locations.filter((item) => readAssetKind(item as unknown as Record<string, unknown>) !== 'prop').map((item) => item.name).join('、')
     : '无'
   const charactersLibName = novelData.characters.length > 0
     ? novelData.characters.map((item) => item.name).join('、')
+    : '无'
+  const propsLibName = novelData.locations.filter((item) => readAssetKind(item as unknown as Record<string, unknown>) === 'prop').length > 0
+    ? novelData.locations.filter((item) => readAssetKind(item as unknown as Record<string, unknown>) === 'prop').map((item) => item.name).join('、')
     : '无'
   const charactersIntroduction = buildCharactersIntroduction(novelData.characters)
   const promptTemplateBase = buildPrompt({
@@ -115,6 +111,7 @@ export async function handleClipsBuildTask(job: Job<TaskJobData>) {
       input: contentToProcess,
       locations_lib_name: locationsLibName,
       characters_lib_name: charactersLibName,
+      props_lib_name: propsLibName,
       characters_introduction: charactersIntroduction,
     },
   })
@@ -135,6 +132,7 @@ export async function handleClipsBuildTask(job: Job<TaskJobData>) {
     summary: string
     location: string | null
     characters: unknown
+    props: unknown
     content: string
   }> = []
   let lastBoundaryError: Error | null = null
@@ -144,22 +142,23 @@ export async function handleClipsBuildTask(job: Job<TaskJobData>) {
       const completion = await withInternalLLMStreamCallbacks(
         streamCallbacks,
         async () =>
-          await chatCompletion(
-            job.data.userId,
-            novelData.analysisModel!,
-            [{ role: 'user', content: promptTemplate }],
-            {
-              projectId,
-              action: 'split_clips',
-              streamStepId: attempt === 1 ? 'split_clips' : `split_clips_retry_${attempt}`,
-              streamStepTitle: '片段切分',
-              streamStepIndex: 1,
-              streamStepTotal: 1,
+          await executeAiTextStep({
+            userId: job.data.userId,
+            model: analysisModel,
+            messages: [{ role: 'user', content: promptTemplate }],
+            projectId,
+            action: 'split_clips',
+            meta: {
+              stepId: 'split_clips',
+              stepAttempt: attempt,
+              stepTitle: '片段切分',
+              stepIndex: 1,
+              stepTotal: 1,
             },
-          ),
+          }),
       )
 
-      const responseText = getCompletionContent(completion)
+      const responseText = completion.text
       if (!responseText) {
         lastBoundaryError = new Error('No response from AI')
         continue
@@ -190,6 +189,7 @@ export async function handleClipsBuildTask(job: Job<TaskJobData>) {
           summary: readText(clipData.summary),
           location: readText(clipData.location) || null,
           characters: clipData.characters,
+          props: clipData.props,
           content: contentToProcess.slice(match.startIndex, match.endIndex),
         })
         searchFrom = match.endIndex
@@ -219,15 +219,34 @@ export async function handleClipsBuildTask(job: Job<TaskJobData>) {
   })
   await assertTaskActive(job, 'clips_build_persist')
 
-  await prisma.novelPromotionClip.deleteMany({
+  const existingClips = await clipModel.findMany({
     where: { episodeId },
+    orderBy: { createdAt: 'asc' },
+    select: { id: true },
   })
-
   const createdClips: Array<{ id: string }> = []
   for (let i = 0; i < resolvedClips.length; i += 1) {
     const clipData = resolvedClips[i]
+    const existing = existingClips[i]
+    if (existing) {
+      const updated = await clipModel.update({
+        where: { id: existing.id },
+        data: {
+          startText: clipData.startText,
+          endText: clipData.endText,
+          summary: clipData.summary,
+          location: clipData.location,
+          characters: clipData.characters ? JSON.stringify(clipData.characters) : null,
+          props: clipData.props ? JSON.stringify(clipData.props) : null,
+          content: clipData.content,
+        },
+        select: { id: true },
+      })
+      createdClips.push(updated)
+      continue
+    }
 
-    const created = await prisma.novelPromotionClip.create({
+    const created = await clipModel.create({
       data: {
         episodeId,
         startText: clipData.startText,
@@ -235,11 +254,23 @@ export async function handleClipsBuildTask(job: Job<TaskJobData>) {
         summary: clipData.summary,
         location: clipData.location,
         characters: clipData.characters ? JSON.stringify(clipData.characters) : null,
+        props: clipData.props ? JSON.stringify(clipData.props) : null,
         content: clipData.content,
       },
       select: { id: true },
     })
     createdClips.push(created)
+  }
+
+  const staleIds = existingClips.slice(resolvedClips.length).map((item) => item.id)
+  if (staleIds.length > 0) {
+    await clipModel.deleteMany({
+      where: {
+        id: {
+          in: staleIds,
+        },
+      },
+    })
   }
 
   await reportTaskProgress(job, 96, {

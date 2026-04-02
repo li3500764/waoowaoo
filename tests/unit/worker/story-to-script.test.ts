@@ -16,22 +16,35 @@ const workerMock = vi.hoisted(() => ({
 
 const configMock = vi.hoisted(() => ({
   resolveProjectModelCapabilityGenerationOptions: vi.fn(async () => ({ reasoningEffort: 'high' })),
+  getUserWorkflowConcurrencyConfig: vi.fn(async () => ({
+    analysis: 2,
+    image: 5,
+    video: 5,
+  })),
 }))
 
 const orchestratorMock = vi.hoisted(() => ({
   runStoryToScriptOrchestrator: vi.fn(),
 }))
-
 const helperMock = vi.hoisted(() => ({
   persistAnalyzedCharacters: vi.fn(async () => [{ id: 'character-new-1' }]),
   persistAnalyzedLocations: vi.fn(async () => [{ id: 'location-new-1' }]),
+  persistAnalyzedProps: vi.fn(async () => [{ id: 'prop-new-1' }]),
   persistClips: vi.fn(async () => [{ clipKey: 'clip-1', id: 'clip-row-1' }]),
+}))
+const workflowLeaseMock = vi.hoisted(() => ({
+  assertWorkflowRunActive: vi.fn(async () => undefined),
+  withWorkflowRunLease: vi.fn(async (params: { run: () => Promise<unknown> }) => ({
+    claimed: true,
+    result: await params.run(),
+  })),
 }))
 
 vi.mock('@/lib/prisma', () => ({ prisma: prismaMock }))
 vi.mock('@/lib/llm-client', () => ({
   chatCompletion: vi.fn(),
   getCompletionParts: vi.fn(() => ({ text: '', reasoning: '' })),
+  getCompletionContent: vi.fn(() => ''),
 }))
 vi.mock('@/lib/config-service', () => configMock)
 vi.mock('@/lib/llm-observe/internal-stream-context', () => ({
@@ -56,8 +69,9 @@ vi.mock('@/lib/prompt-i18n', () => ({
   PROMPT_IDS: {
     NP_AGENT_CHARACTER_PROFILE: 'a',
     NP_SELECT_LOCATION: 'b',
-    NP_AGENT_CLIP: 'c',
-    NP_SCREENPLAY_CONVERSION: 'd',
+    NP_SELECT_PROP: 'c',
+    NP_AGENT_CLIP: 'd',
+    NP_SCREENPLAY_CONVERSION: 'e',
   },
   getPromptTemplate: vi.fn(() => 'prompt-template'),
 }))
@@ -67,13 +81,27 @@ vi.mock('@/lib/workers/handlers/story-to-script-helpers', () => ({
   parseTemperature: vi.fn(() => 0.7),
   persistAnalyzedCharacters: helperMock.persistAnalyzedCharacters,
   persistAnalyzedLocations: helperMock.persistAnalyzedLocations,
+  persistAnalyzedProps: helperMock.persistAnalyzedProps,
   persistClips: helperMock.persistClips,
   resolveClipRecordId: (clipIdMap: Map<string, string>, clipId: string) => clipIdMap.get(clipId) ?? null,
 }))
+vi.mock('@/lib/run-runtime/workflow-lease', () => workflowLeaseMock)
 
 import { handleStoryToScriptTask } from '@/lib/workers/handlers/story-to-script'
 
 function buildJob(payload: Record<string, unknown>, episodeId: string | null = 'episode-1'): Job<TaskJobData> {
+  const runId = typeof payload.runId === 'string' && payload.runId.trim() ? payload.runId.trim() : 'run-test-story'
+  const payloadMeta = payload.meta && typeof payload.meta === 'object' && !Array.isArray(payload.meta)
+    ? (payload.meta as Record<string, unknown>)
+    : {}
+  const normalizedPayload: Record<string, unknown> = {
+    ...payload,
+    runId,
+    meta: {
+      ...payloadMeta,
+      runId,
+    },
+  }
   return {
     data: {
       taskId: 'task-story-to-script-1',
@@ -83,7 +111,7 @@ function buildJob(payload: Record<string, unknown>, episodeId: string | null = '
       episodeId,
       targetType: 'NovelPromotionEpisode',
       targetId: 'episode-1',
-      payload,
+      payload: normalizedPayload,
       userId: 'user-1',
     },
   } as unknown as Job<TaskJobData>
@@ -103,21 +131,21 @@ describe('worker story-to-script behavior', () => {
       id: 'np-project-1',
       analysisModel: 'llm::analysis-1',
       characters: [{ id: 'char-1', name: 'Hero', introduction: 'hero intro' }],
-      locations: [{ id: 'loc-1', name: 'Old Town', summary: 'town' }],
+      locations: [{ id: 'loc-1', name: 'Old Town', summary: 'town', assetKind: 'location' }],
     })
 
-    prismaMock.novelPromotionEpisode.findUnique
-      .mockResolvedValueOnce({
-        id: 'episode-1',
-        novelPromotionProjectId: 'np-project-1',
-        novelText: 'episode text',
-      })
-      .mockResolvedValueOnce({ id: 'episode-1' })
+    prismaMock.novelPromotionEpisode.findUnique.mockResolvedValue({
+      id: 'episode-1',
+      novelPromotionProjectId: 'np-project-1',
+      novelText: 'episode text',
+    })
 
     orchestratorMock.runStoryToScriptOrchestrator.mockResolvedValue({
       analyzedCharacters: [{ name: 'New Hero' }],
       analyzedLocations: [{ name: 'Market' }],
-      clipList: [{ clipId: 'clip-1', content: 'clip content' }],
+      analyzedProps: [{ name: 'Knife', summary: 'bronze dagger' }],
+      propsObject: { props: [{ name: 'Knife', summary: 'bronze dagger' }] },
+      clipList: [{ clipId: 'clip-1', content: 'clip content', props: ['Knife'] }],
       screenplayResults: [
         {
           clipId: 'clip-1',
@@ -129,6 +157,7 @@ describe('worker story-to-script behavior', () => {
         clipCount: 1,
         screenplaySuccessCount: 1,
         screenplayFailedCount: 0,
+        propCount: 1,
       },
     })
   })
@@ -149,12 +178,13 @@ describe('worker story-to-script behavior', () => {
       screenplayFailedCount: 0,
       persistedCharacters: 1,
       persistedLocations: 1,
+      persistedProps: 1,
       persistedClips: 1,
     })
 
     expect(helperMock.persistClips).toHaveBeenCalledWith({
       episodeId: 'episode-1',
-      clipList: [{ clipId: 'clip-1', content: 'clip content' }],
+      clipList: [{ clipId: 'clip-1', content: 'clip content', props: ['Knife'] }],
     })
 
     expect(prismaMock.novelPromotionClip.update).toHaveBeenCalledWith({
@@ -169,6 +199,8 @@ describe('worker story-to-script behavior', () => {
     orchestratorMock.runStoryToScriptOrchestrator.mockResolvedValueOnce({
       analyzedCharacters: [],
       analyzedLocations: [],
+      analyzedProps: [],
+      propsObject: { props: [] },
       clipList: [],
       screenplayResults: [
         {

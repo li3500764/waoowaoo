@@ -1,4 +1,5 @@
 import { prisma } from '@/lib/prisma'
+import { resolveRetryInvalidationStepKeys } from '@/lib/workflow-engine/dependencies'
 import {
   RUN_EVENT_TYPE,
   RUN_STATE_MAX_BYTES,
@@ -30,6 +31,10 @@ type GraphRunRow = {
   errorCode: string | null
   errorMessage: string | null
   cancelRequestedAt: Date | null
+  leaseOwner: string | null
+  leaseExpiresAt: Date | null
+  heartbeatAt: Date | null
+  workflowVersion: number
   queuedAt: Date
   startedAt: Date | null
   finishedAt: Date | null
@@ -53,6 +58,17 @@ type GraphStepRow = {
   lastErrorMessage: string | null
   createdAt: Date
   updatedAt: Date
+}
+
+type GraphArtifactRow = {
+  id: string
+  runId: string
+  stepKey: string | null
+  artifactType: string
+  refId: string
+  versionHash: string | null
+  payload: unknown
+  createdAt: Date
 }
 
 type GraphEventRow = {
@@ -81,6 +97,8 @@ type GraphStepModel = {
   upsert: (args: unknown) => Promise<GraphStepRow>
   findMany: (args: unknown) => Promise<GraphStepRow[]>
   updateMany: (args: unknown) => Promise<{ count: number }>
+  findUnique: (args: unknown) => Promise<GraphStepRow | null>
+  update: (args: unknown) => Promise<GraphStepRow>
 }
 
 type GraphStepAttemptModel = {
@@ -105,12 +123,19 @@ type GraphCheckpointModel = {
   }>>
 }
 
+type GraphArtifactModel = {
+  upsert: (args: unknown) => Promise<GraphArtifactRow>
+  findMany: (args: unknown) => Promise<GraphArtifactRow[]>
+  deleteMany: (args: unknown) => Promise<{ count: number }>
+}
+
 type GraphRuntimeTx = {
   graphRun: GraphRunModel
   graphStep: GraphStepModel
   graphStepAttempt: GraphStepAttemptModel
   graphEvent: GraphEventModel
   graphCheckpoint: GraphCheckpointModel
+  graphArtifact: GraphArtifactModel
 }
 
 type GraphRuntimeClient = GraphRuntimeTx & {
@@ -207,6 +232,10 @@ function mapRunRow(run: GraphRunRow) {
     errorCode: run.errorCode,
     errorMessage: run.errorMessage,
     cancelRequestedAt: toIso(run.cancelRequestedAt),
+    leaseOwner: run.leaseOwner,
+    leaseExpiresAt: toIso(run.leaseExpiresAt),
+    heartbeatAt: toIso(run.heartbeatAt),
+    workflowVersion: run.workflowVersion,
     queuedAt: run.queuedAt.toISOString(),
     startedAt: toIso(run.startedAt),
     finishedAt: toIso(run.finishedAt),
@@ -240,6 +269,121 @@ function mapStepRow(step: GraphStepRow) {
   }
 }
 
+function mapArtifactRow(row: GraphArtifactRow) {
+  return {
+    id: row.id,
+    runId: row.runId,
+    stepKey: row.stepKey,
+    artifactType: row.artifactType,
+    refId: row.refId,
+    versionHash: row.versionHash,
+    payload: row.payload,
+    createdAt: row.createdAt.toISOString(),
+  }
+}
+
+type MysqlIndexRow = {
+  Key_name: string
+  Non_unique: number | string
+  Seq_in_index: number | string
+  Column_name: string
+}
+
+const REQUIRED_GRAPH_ARTIFACT_UNIQUE_COLUMNS = ['runId', 'stepKey', 'artifactType', 'refId'] as const
+let graphArtifactUniqueIndexCheck: Promise<void> | null = null
+
+function toIndexNumber(value: number | string) {
+  if (typeof value === 'number') return value
+  return Number.parseInt(value, 10)
+}
+
+function hasRequiredGraphArtifactUniqueIndex(rows: MysqlIndexRow[]) {
+  const indexColumns = new Map<string, Array<{ seq: number; column: string; nonUnique: number }>>()
+  for (const row of rows) {
+    const seq = toIndexNumber(row.Seq_in_index)
+    const nonUnique = toIndexNumber(row.Non_unique)
+    if (!Number.isFinite(seq) || !Number.isFinite(nonUnique)) continue
+    const key = row.Key_name
+    const list = indexColumns.get(key) || []
+    list.push({
+      seq,
+      column: row.Column_name,
+      nonUnique,
+    })
+    indexColumns.set(key, list)
+  }
+
+  for (const entries of indexColumns.values()) {
+    if (entries.length !== REQUIRED_GRAPH_ARTIFACT_UNIQUE_COLUMNS.length) continue
+    const sorted = entries.sort((a, b) => a.seq - b.seq)
+    if (sorted[0]?.nonUnique !== 0) continue
+    const columns = sorted.map((entry) => entry.column)
+    if (columns.length !== REQUIRED_GRAPH_ARTIFACT_UNIQUE_COLUMNS.length) continue
+    const match = columns.every((column, index) => column === REQUIRED_GRAPH_ARTIFACT_UNIQUE_COLUMNS[index])
+    if (match) return true
+  }
+
+  return false
+}
+
+async function ensureGraphArtifactUniqueIndex() {
+  if (process.env.NODE_ENV === 'test') return
+  if (graphArtifactUniqueIndexCheck) {
+    await graphArtifactUniqueIndexCheck
+    return
+  }
+
+  graphArtifactUniqueIndexCheck = (async () => {
+    const rows = await prisma.$queryRawUnsafe<MysqlIndexRow[]>('SHOW INDEX FROM graph_artifacts')
+    if (!hasRequiredGraphArtifactUniqueIndex(rows)) {
+      throw new Error(
+        'missing required unique index on graph_artifacts(runId, stepKey, artifactType, refId); run migration before starting runtime',
+      )
+    }
+  })()
+
+  try {
+    await graphArtifactUniqueIndexCheck
+  } catch (error) {
+    graphArtifactUniqueIndexCheck = null
+    throw error
+  }
+}
+
+async function upsertArtifactStrict(params: {
+  artifactModel: GraphArtifactModel
+  runId: string
+  stepKey: string
+  artifactType: string
+  refId: string
+  versionHash: string | null
+  payload: unknown
+}) {
+  await ensureGraphArtifactUniqueIndex()
+  return await params.artifactModel.upsert({
+    where: {
+      runId_stepKey_artifactType_refId: {
+        runId: params.runId,
+        stepKey: params.stepKey,
+        artifactType: params.artifactType,
+        refId: params.refId,
+      },
+    },
+    create: {
+      runId: params.runId,
+      stepKey: params.stepKey,
+      artifactType: params.artifactType,
+      refId: params.refId,
+      versionHash: params.versionHash,
+      payload: params.payload,
+    },
+    update: {
+      versionHash: params.versionHash,
+      payload: params.payload,
+    },
+  })
+}
+
 function buildStepProjection(input: RunEventInput) {
   const payload = toObject(input.payload)
   const stepKey = input.stepKey || readString(payload, 'stepKey') || readString(payload, 'stepId')
@@ -254,6 +398,50 @@ function buildStepProjection(input: RunEventInput) {
     stepIndex,
     stepTotal,
     attempt,
+    payload,
+  }
+}
+
+function buildArtifactProjection(params: {
+  runId: string
+  stepKey: string
+  payload: JsonRecord
+  isStepFailed: boolean
+  isStepCompleted: boolean
+}) {
+  const payload = params.payload
+  const artifactType = readString(payload, 'artifactType')
+  const refId = readString(payload, 'artifactRefId') || readString(payload, 'refId') || params.stepKey
+  if (!refId) return null
+
+  const resolvedType = artifactType
+    || (
+      params.isStepFailed
+        ? 'step.error'
+        : params.isStepCompleted
+          ? 'step.output'
+          : null
+    )
+  if (!resolvedType) return null
+
+  const artifactPayload = toObject(payload.artifactPayload)
+  if (Object.keys(artifactPayload).length > 0) {
+    return {
+      runId: params.runId,
+      stepKey: params.stepKey,
+      artifactType: resolvedType,
+      refId,
+      versionHash: readString(payload, 'versionHash'),
+      payload: artifactPayload,
+    }
+  }
+
+  return {
+    runId: params.runId,
+    stepKey: params.stepKey,
+    artifactType: resolvedType,
+    refId,
+    versionHash: readString(payload, 'versionHash'),
     payload,
   }
 }
@@ -279,6 +467,8 @@ async function applyRunProjection(tx: GraphRuntimeTx, input: RunEventInput) {
         status: RUN_STATUS.COMPLETED,
         output: payload,
         finishedAt: now,
+        leaseOwner: null,
+        leaseExpiresAt: null,
       },
     })
     await tx.graphStep.updateMany({
@@ -304,6 +494,8 @@ async function applyRunProjection(tx: GraphRuntimeTx, input: RunEventInput) {
         errorCode: readString(payload, 'errorCode'),
         errorMessage: resolveErrorMessage(payload),
         finishedAt: now,
+        leaseOwner: null,
+        leaseExpiresAt: null,
       },
     })
     await tx.graphStep.updateMany({
@@ -329,6 +521,8 @@ async function applyRunProjection(tx: GraphRuntimeTx, input: RunEventInput) {
       data: {
         status: RUN_STATUS.CANCELED,
         finishedAt: now,
+        leaseOwner: null,
+        leaseExpiresAt: null,
       },
     })
     await tx.graphStep.updateMany({
@@ -439,6 +633,25 @@ async function applyRunProjection(tx: GraphRuntimeTx, input: RunEventInput) {
       usageJson: toObject(stepProjection.payload.usage),
     },
   })
+
+  const artifactProjection = buildArtifactProjection({
+    runId: input.runId,
+    stepKey: stepProjection.stepKey,
+    payload: stepProjection.payload,
+    isStepFailed,
+    isStepCompleted,
+  })
+  if (!artifactProjection) return
+
+  await upsertArtifactStrict({
+    artifactModel: tx.graphArtifact,
+    runId: artifactProjection.runId,
+    stepKey: artifactProjection.stepKey,
+    artifactType: artifactProjection.artifactType,
+    refId: artifactProjection.refId,
+    versionHash: artifactProjection.versionHash || null,
+    payload: artifactProjection.payload || null,
+  })
 }
 
 export async function createRun(input: CreateRunInput) {
@@ -454,6 +667,10 @@ export async function createRun(input: CreateRunInput) {
       targetId: input.targetId,
       status: RUN_STATUS.QUEUED,
       input: input.input || null,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      heartbeatAt: null,
+      workflowVersion: 1,
       queuedAt: new Date(),
       lastSeq: 0,
     },
@@ -477,6 +694,112 @@ export async function getRunById(runId: string) {
   })
   if (!row) return null
   return mapRunRow(row)
+}
+
+export async function findReusableActiveRun(params: {
+  userId: string
+  projectId: string
+  workflowType: string
+  targetType: string
+  targetId: string
+}) {
+  const rows = await runtimeClient.graphRun.findMany({
+    where: {
+      userId: params.userId,
+      projectId: params.projectId,
+      workflowType: params.workflowType,
+      targetType: params.targetType,
+      targetId: params.targetId,
+      status: {
+        in: [RUN_STATUS.QUEUED, RUN_STATUS.RUNNING, RUN_STATUS.CANCELING],
+      },
+    },
+    orderBy: [
+      { updatedAt: 'desc' },
+      { createdAt: 'desc' },
+    ],
+    take: 1,
+  })
+  const row = rows[0]
+  return row ? mapRunRow(row) : null
+}
+
+export async function claimRunLease(params: {
+  runId: string
+  userId: string
+  workerId: string
+  leaseMs: number
+}) {
+  const now = new Date()
+  const leaseExpiresAt = new Date(now.getTime() + Math.max(5_000, Math.floor(params.leaseMs)))
+  const result = await runtimeClient.graphRun.updateMany({
+    where: {
+      id: params.runId,
+      userId: params.userId,
+      status: {
+        in: [RUN_STATUS.QUEUED, RUN_STATUS.RUNNING, RUN_STATUS.CANCELING],
+      },
+      OR: [
+        { leaseOwner: null },
+        { leaseOwner: params.workerId },
+        { leaseExpiresAt: null },
+        { leaseExpiresAt: { lt: now } },
+      ],
+    },
+    data: {
+      leaseOwner: params.workerId,
+      leaseExpiresAt,
+      heartbeatAt: now,
+    },
+  })
+  if (result.count === 0) {
+    return null
+  }
+  return await getRunById(params.runId)
+}
+
+export async function renewRunLease(params: {
+  runId: string
+  userId: string
+  workerId: string
+  leaseMs: number
+}) {
+  const now = new Date()
+  const leaseExpiresAt = new Date(now.getTime() + Math.max(5_000, Math.floor(params.leaseMs)))
+  const result = await runtimeClient.graphRun.updateMany({
+    where: {
+      id: params.runId,
+      userId: params.userId,
+      leaseOwner: params.workerId,
+      status: {
+        in: [RUN_STATUS.QUEUED, RUN_STATUS.RUNNING, RUN_STATUS.CANCELING],
+      },
+    },
+    data: {
+      leaseExpiresAt,
+      heartbeatAt: now,
+    },
+  })
+  if (result.count === 0) {
+    return null
+  }
+  return await getRunById(params.runId)
+}
+
+export async function releaseRunLease(params: {
+  runId: string
+  workerId: string
+}) {
+  await runtimeClient.graphRun.updateMany({
+    where: {
+      id: params.runId,
+      leaseOwner: params.workerId,
+    },
+    data: {
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    },
+  })
 }
 
 export async function getRunSnapshot(runId: string) {
@@ -666,5 +989,183 @@ export async function listCheckpoints(params: {
     },
     orderBy: { version: 'desc' },
     take: safeLimit,
+  })
+}
+
+export async function createArtifact(params: {
+  runId: string
+  stepKey?: string | null
+  artifactType: string
+  refId: string
+  versionHash?: string | null
+  payload?: JsonRecord | null
+}) {
+  const artifactModel = (runtimeClient as unknown as { graphArtifact?: GraphArtifactModel }).graphArtifact
+  if (!artifactModel || typeof artifactModel.upsert !== 'function') {
+    if (process.env.NODE_ENV !== 'test') {
+      throw new Error('graphArtifact model unavailable')
+    }
+    return {
+      id: '',
+      runId: params.runId,
+      stepKey: params.stepKey || '__run__',
+      artifactType: params.artifactType,
+      refId: params.refId,
+      versionHash: params.versionHash || null,
+      payload: params.payload || null,
+      createdAt: new Date().toISOString(),
+    }
+  }
+  const stepKey = typeof params.stepKey === 'string' && params.stepKey.trim()
+    ? params.stepKey.trim()
+    : '__run__'
+  const artifactType = params.artifactType.trim()
+  const refId = params.refId.trim()
+  if (!artifactType) {
+    throw new Error('artifactType is required')
+  }
+  if (!refId) {
+    throw new Error('refId is required')
+  }
+
+  const row = await upsertArtifactStrict({
+    artifactModel,
+    runId: params.runId,
+    stepKey,
+    artifactType,
+    refId,
+    versionHash: params.versionHash || null,
+    payload: params.payload || null,
+  })
+  return mapArtifactRow(row)
+}
+
+export async function listArtifacts(params: {
+  runId: string
+  stepKey?: string
+  artifactType?: string
+  refId?: string
+  limit?: number
+}) {
+  const artifactModel = (runtimeClient as unknown as { graphArtifact?: GraphArtifactModel }).graphArtifact
+  if (!artifactModel || typeof artifactModel.findMany !== 'function') {
+    if (process.env.NODE_ENV !== 'test') {
+      throw new Error('graphArtifact model unavailable')
+    }
+    return []
+  }
+  const safeLimit = Number.isFinite(params.limit || 200)
+    ? Math.min(Math.max(Math.floor(params.limit || 200), 1), 2000)
+    : 200
+  const rows = await artifactModel.findMany({
+    where: {
+      runId: params.runId,
+      ...(params.stepKey ? { stepKey: params.stepKey } : {}),
+      ...(params.artifactType ? { artifactType: params.artifactType } : {}),
+      ...(params.refId ? { refId: params.refId } : {}),
+    },
+    orderBy: { createdAt: 'desc' },
+    take: safeLimit,
+  })
+  return rows.map(mapArtifactRow)
+}
+
+export async function retryFailedStep(params: {
+  runId: string
+  userId: string
+  stepKey: string
+}) {
+  const stepKey = params.stepKey.trim()
+  if (!stepKey) {
+    throw new Error('stepKey is required')
+  }
+
+  return await runtimeClient.$transaction(async (tx) => {
+    const run = await tx.graphRun.findUnique({
+      where: { id: params.runId },
+    })
+    if (!run || run.userId !== params.userId) {
+      return null
+    }
+
+    const step = await tx.graphStep.findUnique({
+      where: {
+        runId_stepKey: {
+          runId: params.runId,
+          stepKey,
+        },
+      },
+    })
+    if (!step) {
+      throw new Error('RUN_STEP_NOT_FOUND')
+    }
+    if (step.status !== RUN_STEP_STATUS.FAILED) {
+      throw new Error('RUN_STEP_NOT_FAILED')
+    }
+
+    const steps = await tx.graphStep.findMany({
+      where: { runId: params.runId },
+      orderBy: [
+        { stepIndex: 'asc' },
+        { updatedAt: 'asc' },
+      ],
+    })
+    const now = new Date()
+    const nextAttempt = Math.max(1, step.currentAttempt + 1)
+    const invalidatedStepKeys = resolveRetryInvalidationStepKeys({
+      workflowType: run.workflowType,
+      stepKey,
+      existingStepKeys: steps.map((item) => item.stepKey),
+    })
+
+    const updatedRun = await tx.graphRun.update({
+      where: { id: params.runId },
+      data: {
+        status: RUN_STATUS.RUNNING,
+        errorCode: null,
+        errorMessage: null,
+        finishedAt: null,
+        cancelRequestedAt: null,
+        startedAt: run.startedAt || now,
+      },
+    })
+    await tx.graphStep.updateMany({
+      where: {
+        runId: params.runId,
+        stepKey: { in: invalidatedStepKeys },
+      },
+      data: {
+        status: RUN_STEP_STATUS.PENDING,
+        currentAttempt: 0,
+        startedAt: null,
+        finishedAt: null,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+      },
+    })
+    const updatedStep = await tx.graphStep.update({
+      where: {
+        runId_stepKey: {
+          runId: params.runId,
+          stepKey,
+        },
+      },
+      data: {
+        currentAttempt: nextAttempt,
+      },
+    })
+    await tx.graphArtifact.deleteMany({
+      where: {
+        runId: params.runId,
+        stepKey: { in: invalidatedStepKeys },
+      },
+    })
+
+    return {
+      run: mapRunRow(updatedRun),
+      step: mapStepRow(updatedStep),
+      retryAttempt: nextAttempt,
+      invalidatedStepKeys,
+    }
   })
 }

@@ -9,12 +9,26 @@ import { ImageGenerator, VideoGenerator, AudioGenerator } from './base'
 import { FalBananaGenerator } from './fal'
 import { ArkSeedreamGenerator, ArkSeedanceVideoGenerator } from './ark'
 import { FalVideoGenerator } from './fal'
-import { GoogleGeminiImageGenerator, GoogleImagenGenerator, GoogleGeminiBatchImageGenerator, GeminiCompatibleImageGenerator } from './image'
+import {
+    GoogleGeminiImageGenerator,
+    GoogleImagenGenerator,
+    GoogleGeminiBatchImageGenerator,
+    GeminiCompatibleImageGenerator,
+    OpenAICompatibleImageGenerator,
+} from './image'
 import { GoogleVeoVideoGenerator } from './video/google'
-import { QwenTTSGenerator } from './audio'
+import { OpenAICompatibleVideoGenerator } from './video'
 import { MinimaxVideoGenerator } from './minimax'
 import { ViduVideoGenerator } from './vidu'
 import { getProviderKey } from '@/lib/api-config'
+import {
+    BailianAudioGenerator,
+    BailianImageGenerator,
+    BailianVideoGenerator,
+    SiliconFlowAudioGenerator,
+    SiliconFlowImageGenerator,
+    SiliconFlowVideoGenerator,
+} from './official'
 
 /**
  * 根据 provider 创建图片生成器
@@ -48,7 +62,11 @@ export function createImageGenerator(provider: string, modelId?: string): ImageG
         case 'gemini-compatible':
             return new GeminiCompatibleImageGenerator(actualModelId, provider)
         case 'openai-compatible':
-            throw new Error('PROVIDER_TYPE_UNSUPPORTED: openai-compatible only supports llm')
+            return new OpenAICompatibleImageGenerator(actualModelId, provider)
+        case 'bailian':
+            return new BailianImageGenerator()
+        case 'siliconflow':
+            return new SiliconFlowImageGenerator()
         default:
             throw new Error(`Unknown image generator provider: ${provider}`)
     }
@@ -73,7 +91,11 @@ export function createVideoGenerator(provider: string): VideoGenerator {
         case 'vidu':
             return new ViduVideoGenerator()
         case 'openai-compatible':
-            throw new Error('PROVIDER_TYPE_UNSUPPORTED: openai-compatible only supports llm')
+            return new OpenAICompatibleVideoGenerator(provider)
+        case 'bailian':
+            return new BailianVideoGenerator()
+        case 'siliconflow':
+            return new SiliconFlowVideoGenerator()
         default:
             throw new Error(`Unknown video generator provider: ${provider}`)
     }
@@ -85,8 +107,10 @@ export function createVideoGenerator(provider: string): VideoGenerator {
 export function createAudioGenerator(provider: string): AudioGenerator {
     const providerKey = getProviderKey(provider).toLowerCase()
     switch (providerKey) {
-        case 'qwen':
-            return new QwenTTSGenerator()
+        case 'bailian':
+            return new BailianAudioGenerator()
+        case 'siliconflow':
+            return new SiliconFlowAudioGenerator()
         default:
             throw new Error(`Unknown audio generator provider: ${provider}`)
     }

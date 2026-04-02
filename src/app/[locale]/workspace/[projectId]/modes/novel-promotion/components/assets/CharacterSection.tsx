@@ -4,6 +4,7 @@ import { useTranslations } from 'next-intl'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import TaskStatusInline from '@/components/task/TaskStatusInline'
 import { resolveTaskPresentationState } from '@/lib/task/presentation'
+import type { TaskPresentationState } from '@/lib/task/presentation'
 import { PRIMARY_APPEARANCE_INDEX } from '@/lib/constants'
 
 /**
@@ -11,11 +12,14 @@ import { PRIMARY_APPEARANCE_INDEX } from '@/lib/constants'
  * 从 AssetsStage.tsx 提取，负责角色列表的展示和操作
  * 
  * 🔥 V6.5 重构：内部直接订阅 useProjectAssets，消除 props drilling
+ * 🔥 V7 重构：待确认角色档案内嵌显示，不再使用独立 Section
  */
 
 import { Character, CharacterAppearance } from '@/types/project'
 import { useProjectAssets } from '@/lib/query/hooks/useProjectAssets'
 import CharacterCard from './CharacterCard'
+import CharacterProfileCard from './CharacterProfileCard'
+import { parseProfileData } from '@/types/character-profile'
 import { AppIcon } from '@/components/ui/icons'
 
 interface CharacterSectionProps {
@@ -25,6 +29,7 @@ interface CharacterSectionProps {
     focusCharacterRequestId?: number
     activeTaskKeys: Set<string>
     onClearTaskKey: (key: string) => void
+    onRegisterTransientTaskKey: (key: string) => void
     isAnalyzingAssets: boolean
     // 回调函数
     onAddCharacter: () => void
@@ -32,11 +37,11 @@ interface CharacterSectionProps {
     onDeleteAppearance: (characterId: string, appearanceId: string) => void
     onEditAppearance: (characterId: string, characterName: string, appearance: CharacterAppearance, introduction?: string | null) => void
     // 🔥 V6.6 重构：重命名为 handleGenerateImage
-    handleGenerateImage: (type: 'character' | 'location', id: string, appearanceId?: string) => void
+    handleGenerateImage: (type: 'character' | 'location', id: string, appearanceId?: string, count?: number) => Promise<void>
     onSelectImage: (characterId: string, appearanceId: string, imageIndex: number | null) => void
     onConfirmSelection: (characterId: string, appearanceId: string) => void
-    onRegenerateSingle: (characterId: string, appearanceId: string, imageIndex: number) => void
-    onRegenerateGroup: (characterId: string, appearanceId: string) => void
+    onRegenerateSingle: (characterId: string, appearanceId: string, imageIndex: number) => Promise<void>
+    onRegenerateGroup: (characterId: string, appearanceId: string, count?: number) => Promise<void>
     onUndo: (characterId: string, appearanceId: string) => void
     onImageClick: (imageUrl: string) => void
     onImageEdit: (characterId: string, appearanceId: string, imageIndex: number, characterName: string) => void
@@ -46,6 +51,19 @@ interface CharacterSectionProps {
     onCopyFromGlobal: (characterId: string) => void  // 🆕 从资产中心复制
     // 辅助函数
     getAppearances: (character: Character) => CharacterAppearance[]
+    /** 分集筛选：仅显示指定 ID 的角色，null 表示显示全部 */
+    filterIds?: Set<string> | null
+    // 🔥 V7：待确认角色档案（内嵌到 CharacterSection）
+    unconfirmedCharacters: Character[]
+    isConfirmingCharacter: (characterId: string) => boolean
+    deletingCharacterId: string | null
+    batchConfirming: boolean
+    batchConfirmingState: TaskPresentationState | null
+    onBatchConfirm: () => void
+    onEditProfile: (characterId: string, characterName: string) => void
+    onConfirmProfile: (characterId: string) => void
+    onUseExistingProfile: (characterId: string) => void
+    onDeleteProfile: (characterId: string) => void
 }
 
 export default function CharacterSection({
@@ -55,6 +73,7 @@ export default function CharacterSection({
     focusCharacterRequestId = 0,
     activeTaskKeys,
     onClearTaskKey,
+    onRegisterTransientTaskKey,
     isAnalyzingAssets,
     onAddCharacter,
     onDeleteCharacter,
@@ -72,7 +91,19 @@ export default function CharacterSection({
     onVoiceDesign,
     onVoiceSelectFromHub,
     onCopyFromGlobal,
-    getAppearances
+    getAppearances,
+    filterIds = null,
+    // 🔥 V7：待确认角色
+    unconfirmedCharacters,
+    isConfirmingCharacter,
+    deletingCharacterId,
+    batchConfirming,
+    batchConfirmingState,
+    onBatchConfirm,
+    onEditProfile,
+    onConfirmProfile,
+    onUseExistingProfile,
+    onDeleteProfile,
 }: CharacterSectionProps) {
     const t = useTranslations('assets')
     const analyzingAssetsState = isAnalyzingAssets
@@ -84,9 +115,20 @@ export default function CharacterSection({
         })
         : null
 
-    // 🔥 V6.5 重构：直接订阅缓存，消除 props drilling
     const { data: assets } = useProjectAssets(projectId)
-    const characters: Character[] = useMemo(() => assets?.characters ?? [], [assets?.characters])
+    const allCharacters: Character[] = useMemo(() => assets?.characters ?? [], [assets?.characters])
+    // 🔥 V7：排除待确认角色，避免同一角色在待确认区与已确认网格中重复出现
+    const unconfirmedIds = useMemo(
+        () => new Set(unconfirmedCharacters.map((c) => c.id)),
+        [unconfirmedCharacters],
+    )
+    const characters: Character[] = useMemo(
+        () => {
+            const base = filterIds ? allCharacters.filter((c) => filterIds.has(c.id)) : allCharacters
+            return base.filter((c) => !unconfirmedIds.has(c.id))
+        },
+        [allCharacters, filterIds, unconfirmedIds],
+    )
     const [highlightedCharacterId, setHighlightedCharacterId] = useState<string | null>(null)
     const scrollAnimationRef = useRef<number | null>(null)
 
@@ -171,6 +213,54 @@ export default function CharacterSection({
                 </button>
             </div>
 
+            {/* 🔥 V7：待确认角色档案 - 内嵌引导横幅 */}
+            {unconfirmedCharacters.length > 0 && (
+                <div className="mb-6">
+                    {/* 引导横幅 */}
+                    <div className="flex items-center justify-between mb-3 px-1">
+                        <div className="flex items-center gap-2">
+                            <span className="inline-flex h-5 w-5 items-center justify-center rounded-md bg-[var(--glass-tone-info-bg)]">
+                                <AppIcon name="sparkles" className="h-3 w-3 text-[var(--glass-tone-info-fg)]" />
+                            </span>
+                            <span className="text-sm font-semibold text-[var(--glass-text-primary)]">{t('stage.pendingProfilesBanner')}</span>
+                            <span className="text-xs text-[var(--glass-text-tertiary)]">{t('stage.pendingProfilesHint')}</span>
+                        </div>
+                        <button
+                            onClick={onBatchConfirm}
+                            disabled={batchConfirming}
+                            className="glass-btn-base glass-btn-primary px-3 py-1.5 text-sm disabled:opacity-50 flex items-center gap-1.5"
+                        >
+                            {batchConfirming ? (
+                                <TaskStatusInline state={batchConfirmingState} className="text-white [&>span]:text-white [&_svg]:text-white" />
+                            ) : (
+                                t('stage.confirmAll', { count: unconfirmedCharacters.length })
+                            )}
+                        </button>
+                    </div>
+                    {/* 待确认卡片网格 */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                        {unconfirmedCharacters.map((character) => {
+                            const profileData = parseProfileData(character.profileData!)
+                            if (!profileData) return null
+                            return (
+                                <CharacterProfileCard
+                                    key={character.id}
+                                    characterId={character.id}
+                                    name={character.name}
+                                    profileData={profileData}
+                                    onEdit={() => onEditProfile(character.id, character.name)}
+                                    onConfirm={() => onConfirmProfile(character.id)}
+                                    onUseExisting={() => onUseExistingProfile(character.id)}
+                                    onDelete={() => onDeleteProfile(character.id)}
+                                    isConfirming={isConfirmingCharacter(character.id)}
+                                    isDeleting={deletingCharacterId === character.id}
+                                />
+                            )
+                        })}
+                    </div>
+                </div>
+            )}
+
             {/* 按角色分组显示：外层 grid 让多角色并排 */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 {characters.map(character => {
@@ -190,7 +280,7 @@ export default function CharacterSection({
                             className={`glass-surface rounded-xl p-4 scroll-mt-24 transition-all duration-700 ${highlightedCharacterId === character.id ? 'ring-2 ring-[var(--glass-focus-ring)] bg-[var(--glass-tone-info-bg)]/40' : ''}`}
                         >
                             {/* 角色标题 */}
-                            <div className="flex items-center justify-between border-b border-[var(--glass-stroke-base)] pb-2">
+                            <div className="flex items-center justify-between pb-2">
                                 <div className="flex items-center gap-3">
                                     <h3 className="text-base font-semibold text-[var(--glass-text-primary)]">{character.name}</h3>
                                     <span className="text-xs text-[var(--glass-text-tertiary)]">
@@ -228,7 +318,7 @@ export default function CharacterSection({
                                             onEdit={() => onEditAppearance(character.id, character.name, appearance, character.introduction)}
                                             onDelete={() => onDeleteCharacter(character.id)}
                                             onDeleteAppearance={() => appearance.id && onDeleteAppearance(character.id, appearance.id)}
-                                            onRegenerate={() => {
+                                            onRegenerate={(count) => {
                                                 // 获取有效图片数量
                                                 const imageUrls = appearance.imageUrls || []
                                                 const validImageCount = imageUrls.filter(url => !!url).length
@@ -244,16 +334,30 @@ export default function CharacterSection({
                                                 // 单图：重新生成单张
                                                 if (validImageCount === 1) {
                                                     const selectedIndex = appearance.selectedIndex ?? 0
+                                                    const taskKey = `character-${character.id}-${appearance.appearanceIndex}-${selectedIndex}`
                                                     _ulogInfo('[CharacterSection] 调用单张重新生成, imageIndex:', selectedIndex)
-                                                    onRegenerateSingle(character.id, appearance.id, selectedIndex)
+                                                    onRegisterTransientTaskKey(taskKey)
+                                                    void onRegenerateSingle(character.id, appearance.id, selectedIndex).catch(() => {
+                                                        onClearTaskKey(taskKey)
+                                                    })
                                                 }
                                                 // 多图或无图：重新生成整组
                                                 else {
+                                                    const taskKey = `character-${character.id}-${appearance.appearanceIndex}-group`
                                                     _ulogInfo('[CharacterSection] 调用整组重新生成')
-                                                    onRegenerateGroup(character.id, appearance.id)
+                                                    onRegisterTransientTaskKey(taskKey)
+                                                    void onRegenerateGroup(character.id, appearance.id, count).catch(() => {
+                                                        onClearTaskKey(taskKey)
+                                                    })
                                                 }
                                             }}
-                                            onGenerate={() => handleGenerateImage('character', character.id, appearance.id)}
+                                            onGenerate={(count) => {
+                                                const taskKey = `character-${character.id}-${appearance.appearanceIndex}-group`
+                                                onRegisterTransientTaskKey(taskKey)
+                                                void handleGenerateImage('character', character.id, appearance.id, count).catch(() => {
+                                                    onClearTaskKey(taskKey)
+                                                })
+                                            }}
                                             onUndo={() => onUndo(character.id, appearance.id)}
                                             onImageClick={onImageClick}
                                             showDeleteButton={true}

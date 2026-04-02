@@ -81,14 +81,26 @@ export function useGenerateCharacterImage() {
   const invalidateCharacters = () => invalidateGlobalCharacters(queryClient)
 
   return useMutation({
-    mutationFn: async ({ characterId, appearanceIndex }: { characterId: string; appearanceIndex: number }) => {
-      return await requestJsonWithError('/api/asset-hub/generate-image', {
+    mutationFn: async ({
+      characterId,
+      appearanceIndex,
+      artStyle,
+      count,
+    }: {
+      characterId: string
+      appearanceIndex: number
+      artStyle?: string
+      count?: number
+    }) => {
+      return await requestJsonWithError(`/api/assets/${characterId}/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          type: 'character',
-          id: characterId,
+          scope: 'global',
+          kind: 'character',
           appearanceIndex,
+          artStyle,
+          count,
         }),
       }, 'Failed to generate image')
     },
@@ -129,12 +141,12 @@ export function useModifyCharacterImage() {
       modifyPrompt: string
       extraImageUrls?: string[]
     }) => {
-      return await requestJsonWithError('/api/asset-hub/modify-image', {
+      return await requestJsonWithError(`/api/assets/${characterId}/modify-render`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          type: 'character',
-          id: characterId,
+          scope: 'global',
+          kind: 'character',
           appearanceIndex,
           imageIndex,
           modifyPrompt,
@@ -178,12 +190,12 @@ export function useSelectCharacterImage() {
       imageIndex: number | null
       confirm?: boolean
     }) => {
-      return await requestJsonWithError('/api/asset-hub/select-image', {
+      return await requestJsonWithError(`/api/assets/${characterId}/select-render`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          type: 'character',
-          id: characterId,
+          scope: 'global',
+          kind: 'character',
           appearanceIndex,
           imageIndex,
           confirm,
@@ -240,12 +252,12 @@ export function useUndoCharacterImage() {
 
   return useMutation({
     mutationFn: async ({ characterId, appearanceIndex }: { characterId: string; appearanceIndex: number }) => {
-      return await requestJsonWithError('/api/asset-hub/undo-image', {
+      return await requestJsonWithError(`/api/assets/${characterId}/revert-render`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          type: 'character',
-          id: characterId,
+          scope: 'global',
+          kind: 'character',
           appearanceIndex,
         }),
       }, 'Failed to undo image')
